@@ -4,6 +4,8 @@ services:
     container_name: tradingagents-web
     env_file:
       - .env
+    environment:
+      - HOME=/home/appuser
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
     ports:
