@@ -8,6 +8,7 @@ from typing import Any
 import streamlit as st
 
 from web.pdf_export import generate_pdf
+from web.components.chat_panel import render_chat, render_quick_feedback
 
 
 def _strip_think(text: str) -> str:
@@ -100,8 +101,12 @@ def render_report(
         content = final_state.get(key, "")
         if not content:
             continue
-        with st.expander(title, expanded=False):
-            st.markdown(_strip_think(str(content)))
+        # Check quality status for badge
+        stripped_content = _strip_think(str(content))
+        has_repair_mark = "⚠️ **[质量门控:" in stripped_content
+        badge = ' <span style="background:#7f1d1d;color:#fca5a5;font-size:0.7rem;padding:2px 6px;border-radius:4px;margin-left:0.3rem;">⚠️ 修复未通过</span>' if has_repair_mark else ""
+        with st.expander(f"{title}{badge}", expanded=False):
+            st.markdown(stripped_content)
 
     debate = final_state.get("investment_debate_state")
     if debate and isinstance(debate, dict):
@@ -136,3 +141,22 @@ def render_report(
     if dqs:
         with st.expander("✅ 数据质量", expanded=False):
             st.markdown(str(dqs))
+
+    # ── Repair log ─────────────────────────────────────────────────────────
+    qrl = final_state.get("quality_repair_log", "")
+    if qrl:
+        with st.expander("🔧 质量修复记录", expanded=False):
+            st.markdown(qrl)
+
+    # ── Chat panel ─────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 💬 分析对话")
+    st.markdown(
+        '<div style="font-size:0.85rem; color:#888; margin-bottom:0.5rem;">'
+        '在此补充意见、提出问题或反馈分析中的问题'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    render_quick_feedback(ticker, trade_date)
+    render_chat(ticker, trade_date)

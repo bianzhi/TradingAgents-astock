@@ -5,6 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from web.progress import PIPELINE_STAGES, ProgressTracker
+from web.components.chat_panel import render_chat, render_quick_feedback
 
 
 def _status_badge(status: str) -> str:
@@ -96,6 +97,10 @@ def render_progress(tracker: ProgressTracker) -> None:
     if tracker.error:
         st.error(f"错误: {tracker.error}")
 
+    if tracker.repair_log:
+        with st.expander("🔧 质量修复记录", expanded=False):
+            st.markdown(tracker.repair_log)
+
     completed_reports = [
         (stage["name"], stage["icon"], tracker.stage_reports[stage["id"]])
         for stage in PIPELINE_STAGES
@@ -112,3 +117,15 @@ def render_progress(tracker: ProgressTracker) -> None:
             is_latest = (name == completed_reports[-1][0])
             with st.expander(f"{icon} {name}", expanded=is_latest):
                 st.markdown(report[:3000])
+
+    # ── Chat panel (available during analysis) ────────────────────────────
+    st.markdown("---")
+    st.markdown("### 💬 分析对话")
+    st.markdown(
+        '<div style="font-size:0.85rem; color:#888; margin-bottom:0.5rem;">'
+        '分析过程中可随时补充意见或反馈问题'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    render_quick_feedback(tracker.ticker, tracker.trade_date)
+    render_chat(tracker.ticker, tracker.trade_date)

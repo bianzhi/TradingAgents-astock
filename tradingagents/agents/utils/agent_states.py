@@ -62,6 +62,7 @@ class AgentState(MessagesState):
 
     # data quality gate
     data_quality_summary: Annotated[str, "Quality gate assessment of all analyst reports (hard checks + LLM review)"]
+    quality_repair_log: Annotated[str, "Log of auto-repair attempts for failing analyst reports"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[

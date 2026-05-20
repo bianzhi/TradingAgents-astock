@@ -37,6 +37,10 @@ def _detect_completed_stages(
     if dqs and tracker.stage_status("quality_gate") != "done":
         tracker.mark_stage_done("quality_gate", str(dqs))
 
+    qrl = chunk.get("quality_repair_log", "")
+    if qrl:
+        tracker.repair_log = str(qrl)
+
     debate = chunk.get("investment_debate_state")
     if debate and isinstance(debate, dict):
         judge = debate.get("judge_decision", "")
