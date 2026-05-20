@@ -309,7 +309,7 @@ class _ReportPDF(FPDF):
         self.ln(12)
 
         cleaned = _strip_think(content)
-        self._render_markdown(cleaned)
+        self._render_markdown(cleaned, parent_level=level)
 
     def add_subsection(self, title: str, content: str, level: int = 1) -> None:
         """Add a subsection with a nested PDF bookmark."""
@@ -322,14 +322,29 @@ class _ReportPDF(FPDF):
         self.ln(9)
 
         cleaned = _strip_think(content)
-        self._render_markdown(cleaned)
+        self._render_markdown(cleaned, parent_level=level)
 
     # ── Markdown renderer with hyperlink support ───────────────────────────
 
-    def _render_markdown(self, text: str) -> None:
-        """Render markdown text with basic styling and clickable hyperlinks."""
+    def _render_markdown(self, text: str, parent_level: int = 0) -> None:
+        """Render markdown text with basic styling and clickable hyperlinks.
+
+        Headings inside the markdown content are mapped to outline levels
+        relative to *parent_level* so that the PDF bookmark hierarchy stays
+        coherent (fpdf2 forbids skipping levels, e.g. 0 → 2).
+            #  → parent_level + 1  (or parent_level + 2 if parent is 0 and no ## precedes)
+            ## → parent_level + 1
+            ### → parent_level + 2
+
+        Because LLM output may jump directly from the section title to a
+        sub-sub-heading (e.g. ``###`` without a preceding ``##``), we
+        demote headings that would cause a skip: the child level is
+        ``min(parent_level + heading_depth, last_level + 1)``.
+        """
         lines = text.split("\n")
         i = 0
+        last_section_level = parent_level  # track the deepest bookmark level used
+
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
@@ -340,29 +355,34 @@ class _ReportPDF(FPDF):
                 i += 1
                 continue
 
-            # Headings
-            if stripped.startswith("###"):
-                self.start_section(name=stripped.lstrip("#").strip(), level=2)
-                self._use_font("B", 11)
-                self.set_text_color(50, 50, 50)
-                self.cell(0, 7, stripped.lstrip("#").strip())
-                self.ln(8)
-                i += 1
-                continue
-            if stripped.startswith("##"):
-                self.start_section(name=stripped.lstrip("#").strip(), level=1)
-                self._use_font("B", 13)
-                self.set_text_color(40, 40, 40)
-                self.cell(0, 8, stripped.lstrip("#").strip())
-                self.ln(9)
-                i += 1
-                continue
+            # Headings — compute safe outline level
             if stripped.startswith("#"):
-                self.start_section(name=stripped.lstrip("#").strip(), level=1)
-                self._use_font("B", 14)
-                self.set_text_color(255, 90, 31)
-                self.cell(0, 9, stripped.lstrip("#").strip())
-                self.ln(10)
+                hashes = len(stripped) - len(stripped.lstrip("#"))
+                heading_text = stripped.lstrip("#").strip()
+                # Desired outline level relative to parent
+                desired_level = parent_level + hashes
+                # Ensure no level-skipping: can only go one deeper than last
+                safe_level = min(desired_level, last_section_level + 1)
+                last_section_level = safe_level
+
+                self.start_section(name=heading_text, level=safe_level)
+
+                # Visual style depends on heading depth (not outline level)
+                if hashes >= 3:
+                    self._use_font("B", 11)
+                    self.set_text_color(50, 50, 50)
+                    self.cell(0, 7, heading_text)
+                    self.ln(8)
+                elif hashes == 2:
+                    self._use_font("B", 13)
+                    self.set_text_color(40, 40, 40)
+                    self.cell(0, 8, heading_text)
+                    self.ln(9)
+                else:
+                    self._use_font("B", 14)
+                    self.set_text_color(255, 90, 31)
+                    self.cell(0, 9, heading_text)
+                    self.ln(10)
                 i += 1
                 continue
 

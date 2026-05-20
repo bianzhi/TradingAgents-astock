@@ -45,6 +45,8 @@ class ProgressTracker:
     final_state: dict[str, Any] = field(default_factory=dict)
     signal: str = ""
 
+    partial_state: dict[str, Any] = field(default_factory=dict)
+
     repair_log: str = ""
 
     llm_calls: int = 0
@@ -73,10 +75,12 @@ class ProgressTracker:
             self.is_running = False
             self.is_complete = True
 
-    def mark_error(self, err: str) -> None:
+    def mark_error(self, err: str, partial_state: dict | None = None) -> None:
         with self._lock:
             self.error = err
             self.is_running = False
+            if partial_state is not None:
+                self.partial_state = partial_state
 
     def update_stats(self, llm: int, tool: int, tok_in: int, tok_out: int) -> None:
         with self._lock:

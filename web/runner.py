@@ -10,6 +10,7 @@ from web.progress import PIPELINE_STAGES, ProgressTracker
 
 
 _REPORT_KEY_TO_STAGE = {s["report_key"]: s["id"] for s in PIPELINE_STAGES}
+_STAGE_TO_REPORT_KEY = {s["id"]: s["report_key"] for s in PIPELINE_STAGES}
 
 _ANALYST_REPORT_KEYS = [
     "market_report", "sentiment_report", "news_report",
@@ -78,6 +79,8 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
 
     stats = StatsCallbackHandler()
 
+    config["checkpoint_enabled"] = True
+
     graph = TradingAgentsGraph(
         debug=True,
         config=config,
@@ -97,12 +100,35 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
         s = stats.get_stats()
         tracker.update_stats(s["llm_calls"], s["tool_calls"], s["tokens_in"], s["tokens_out"])
 
-    signal = graph.process_signal(last_chunk.get("final_trade_decision", ""))
+    # Build partial_state with report_key (not stage_id) as dict keys,
+    # so it's compatible with render_report / generate_pdf.
+    def _build_partial_state() -> dict[str, Any]:
+        partial: dict[str, Any] = {}
+        for stage_id, content in tracker.stage_reports.items():
+            if content:
+                report_key = _STAGE_TO_REPORT_KEY.get(stage_id, stage_id)
+                partial[report_key] = content
+        if tracker.repair_log:
+            partial["quality_repair_log"] = tracker.repair_log
+        # Merge in any raw state keys from last_chunk (for debate/risk dict etc.)
+        if last_chunk:
+            for k in ("investment_debate_state", "risk_debate_state",
+                      "investment_plan", "trader_investment_plan",
+                      "final_trade_decision", "data_quality_summary"):
+                v = last_chunk.get(k)
+                if v and k not in partial:
+                    partial[k] = v
+        return partial
 
-    graph.ticker = ticker
-    graph._log_state(trade_date, last_chunk)
+    try:
+        signal = graph.process_signal(last_chunk.get("final_trade_decision", ""))
 
-    tracker.mark_complete(last_chunk, signal)
+        graph.ticker = ticker
+        graph._log_state(trade_date, last_chunk)
+
+        tracker.mark_complete(last_chunk, signal)
+    except Exception:
+        raise
 
 
 def run_analysis_in_thread(
@@ -121,7 +147,17 @@ def run_analysis_in_thread(
         try:
             _run(ticker, trade_date, config, tracker)
         except Exception as exc:
-            tracker.mark_error(str(exc))
+            # Build partial_state using the same mapping as _build_partial_state,
+            # but we can't access the closure's last_chunk here — fall back to
+            # stage_reports with report_key mapping.
+            partial_state: dict[str, Any] = {}
+            for stage_id, content in tracker.stage_reports.items():
+                if content:
+                    report_key = _STAGE_TO_REPORT_KEY.get(stage_id, stage_id)
+                    partial_state[report_key] = content
+            if tracker.repair_log:
+                partial_state["quality_repair_log"] = tracker.repair_log
+            tracker.mark_error(str(exc), partial_state=partial_state)
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()

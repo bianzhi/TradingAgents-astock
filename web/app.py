@@ -207,6 +207,15 @@ elif tracker and tracker.is_complete:
 # State 4: Analysis errored
 elif tracker and tracker.error:
     st.error(f"分析失败: {tracker.error}")
+    if getattr(tracker, "partial_state", None):
+        with st.expander("📡 已完成的部分分析", expanded=True):
+            st.caption("_⚠️ 以下为出错前已完成的部分结果，可能不完整_")
+            render_report(
+                tracker.partial_state,
+                tracker.ticker,
+                tracker.trade_date,
+                tracker.signal or "N/A",
+            )
     if st.button("重试"):
         st.session_state.pop("tracker", None)
         st.rerun()
