@@ -326,6 +326,71 @@ class _ReportPDF(FPDF):
 
     # ── Markdown renderer with hyperlink support ───────────────────────────
 
+    def _render_table_block(self, header: list[str], rows: list[list[str]],
+                            aligns: list[str] | None = None) -> None:
+        """Render a markdown table block using fpdf2 Table API.
+
+        Features: bordered cells, header with colored background, zebra striping,
+        and auto text wrapping (no 'not enough horizontal space' error).
+
+        Args:
+            header: List of header cell texts.
+            rows: List of rows, each a list of cell texts.
+            aligns: Optional list of align strings ('L','C','R') per column,
+                    parsed from markdown separator line (e.g. :---: means center).
+        """
+        from fpdf.fonts import FontFace
+        from fpdf.enums import Align
+
+        num_cols = len(header) or (len(rows[0]) if rows else 0)
+        if num_cols == 0:
+            return
+
+        # Build align mapping
+        col_aligns: list[str] = []
+        for i in range(num_cols):
+            if aligns and i < len(aligns):
+                col_aligns.append(aligns[i])
+            else:
+                col_aligns.append("L")
+
+        # Headings style (same font family, bold + dark background + white text)
+        kwargs: dict[str, Any] = {
+            "borders_layout": "MINIMAL",
+            "cell_fill_color": (245, 245, 255),
+            "cell_fill_mode": "ROWS",
+            "first_row_as_headings": True,
+            "headings_style": FontFace(
+                emphasis="BOLD",
+                fill_color=(60, 60, 120),
+                color=(255, 255, 255),
+            ),
+        }
+
+        # Choose a smaller font for tables with many columns
+        font_size = 8 if num_cols > 4 else 9
+        self._use_font("", font_size)
+
+        def _clean(text: str) -> str:
+            """Strip markdown inline formatting for display."""
+            return _strip_md_inline(text).strip()
+
+        with self.table(**kwargs) as table:
+            # Header row
+            hrow = table.row()
+            for i, h in enumerate(header):
+                align = Align[col_aligns[i]] if i < len(col_aligns) else Align.L
+                hrow.cell(_clean(h), align=align)
+            # Data rows
+            for row_data in rows:
+                drow = table.row()
+                for i, cell in enumerate(row_data):
+                    align = Align[col_aligns[i]] if i < len(col_aligns) else Align.L
+                    drow.cell(_clean(cell), align=align)
+
+        # Reset font after table
+        self._use_font("", 10)
+
     def _render_markdown(self, text: str, parent_level: int = 0) -> None:
         """Render markdown text with basic styling and clickable hyperlinks.
 
@@ -345,9 +410,66 @@ class _ReportPDF(FPDF):
         i = 0
         last_section_level = parent_level  # track the deepest bookmark level used
 
+        # --- Table accumulation state ---
+        table_header: list[str] = []
+        table_rows: list[list[str]] = []
+        table_aligns: list[str] = []
+        in_table = False
+
+        def _flush_table() -> None:
+            """Flush accumulated table rows to PDF."""
+            nonlocal table_header, table_rows, table_aligns, in_table
+            if table_header or table_rows:
+                self._render_table_block(table_header, table_rows, table_aligns or None)
+                self.ln(3)
+            table_header = []
+            table_rows = []
+            table_aligns = []
+            in_table = False
+
+        def _parse_table_align(sep_line: str) -> list[str]:
+            """Parse markdown table separator line for column alignments.
+
+            Examples: ':---:' = center, ':---' = left, '---:' = right, '---' = left
+            """
+            parts = sep_line.strip("|").split("|")
+            aligns: list[str] = []
+            for p in parts:
+                p = p.strip()
+                if p.startswith(":") and p.endswith(":"):
+                    aligns.append("C")
+                elif p.endswith(":"):
+                    aligns.append("R")
+                else:
+                    aligns.append("L")
+            return aligns
+
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
+
+            # --- Table row detection ---
+            if stripped.startswith("|") and stripped.endswith("|"):
+                # Check if it's a separator line (|---|---|)
+                if re.match(r"^\|[-:\s|]+\|$", stripped):
+                    table_aligns = _parse_table_align(stripped)
+                    in_table = True
+                    i += 1
+                    continue
+                # Parse cells
+                cells = [c.strip() for c in stripped.strip("|").split("|")]
+                if not in_table and not table_header:
+                    # First row is the header
+                    table_header = cells
+                    in_table = True
+                else:
+                    table_rows.append(cells)
+                i += 1
+                continue
+
+            # If we were in a table and hit a non-table line, flush it
+            if in_table:
+                _flush_table()
 
             # Empty line → small gap
             if not stripped:
@@ -410,18 +532,6 @@ class _ReportPDF(FPDF):
                 i += 1
                 continue
 
-            # Table rows
-            if stripped.startswith("|") and stripped.endswith("|"):
-                if re.match(r"^\|[-:\s|]+\|$", stripped):
-                    i += 1
-                    continue
-                self._use_font("", 9)
-                self.set_text_color(60, 60, 60)
-                cells = [c.strip() for c in stripped.strip("|").split("|")]
-                self._render_table_row_with_links(cells)
-                i += 1
-                continue
-
             # Regular paragraph — collect consecutive non-special lines
             para_lines = []
             while i < len(lines):
@@ -443,6 +553,10 @@ class _ReportPDF(FPDF):
                 continue
 
             i += 1
+
+        # Flush any remaining table at end of text
+        if in_table:
+            _flush_table()
 
     def _render_text_segments(self, segments: list[tuple[str, str | None]]) -> None:
         """Render a sequence of (text, url_or_none) segments with auto-wrap.
@@ -532,26 +646,6 @@ class _ReportPDF(FPDF):
         # Has links → render as inline segments
         segments = self._split_rich(text)
         self._render_text_segments(segments)
-
-    def _render_table_row_with_links(self, cells: list[str]) -> None:
-        """Render a table row, each cell may contain links."""
-        col_w = (self.w - self.l_margin - self.r_margin) / max(len(cells), 1)
-        for cell_text in cells:
-            links = re.findall(r"\[(.+?)\]\((.+?)\)", cell_text)
-            clean = _strip_md_inline(cell_text)
-            # Remove markdown link syntax for display text, but keep URL clickable
-            display = re.sub(r"\[(.+?)\]\((.+?)\)", r"\1", clean)
-            # Truncate if text is wider than column to avoid FPDFException
-            while self.get_string_width(display) > col_w - 1 and len(display) > 1:
-                display = display[:-1]
-            if display and self.get_string_width(display) < col_w:
-                if links:
-                    self.cell(col_w, 5, display, link=links[0][1])
-                else:
-                    self.cell(col_w, 5, clean[:len(display)])
-            else:
-                self.cell(col_w, 5, "")
-        self.ln(5)
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
