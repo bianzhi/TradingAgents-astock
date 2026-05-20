@@ -1,4 +1,12 @@
-"""Generate PDF reports from analysis results using fpdf2."""
+"""Generate PDF reports from analysis results using fpdf2.
+
+Features:
+  - Clickable Table of Contents (ToC) page
+  - PDF bookmarks (document outline) for each section
+  - Markdown hyperlinks → clickable PDF links
+  - Chinese CJK font auto-detection
+  - Only report content is exported (no token stats)
+"""
 
 from __future__ import annotations
 
@@ -8,7 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from fpdf import FPDF
+from fpdf.outline import TableOfContents
 
+
+# ── CJK font detection ──────────────────────────────────────────────────────
 
 _FONT_CANDIDATES = [
     "/System/Library/Fonts/PingFang.ttc",
@@ -26,27 +37,21 @@ def _find_cjk_font() -> str | None:
     return None
 
 
+# ── Text helpers ────────────────────────────────────────────────────────────
+
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
 
 
 def _strip_md_inline(text: str) -> str:
-    """Remove inline markdown formatting: **bold**, *italic*, `code`, [link](url)."""
+    """Remove inline markdown formatting: **bold**, *italic*, `code`."""
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"\*(.+?)\*", r"\1", text)
     text = re.sub(r"`(.+?)`", r"\1", text)
-    text = re.sub(r"\[(.+?)\]\(.+?\)", r"\1", text)
     return text
 
 
-def _signal_color(signal: str) -> tuple[int, int, int]:
-    s = signal.upper()
-    if "BUY" in s:
-        return (34, 197, 94)
-    if "SELL" in s:
-        return (239, 68, 68)
-    return (251, 191, 36)
-
+# ── Report sections ────────────────────────────────────────────────────────
 
 _REPORT_SECTIONS = [
     ("market_report", "技术分析报告"),
@@ -58,6 +63,72 @@ _REPORT_SECTIONS = [
     ("lockup_report", "解禁/减持报告"),
 ]
 
+_DEBATE_SUBSECTIONS = [
+    ("bull_history", "多方论点"),
+    ("bear_history", "空方论点"),
+    ("judge_decision", "研究经理决策"),
+]
+
+_RISK_SUBSECTIONS = [
+    ("aggressive_history", "激进观点"),
+    ("conservative_history", "保守观点"),
+    ("neutral_history", "中性观点"),
+    ("judge_decision", "风控决策"),
+]
+
+
+# ── Custom TableOfContents renderer ────────────────────────────────────────
+
+class _CjkTableOfContents(TableOfContents):
+    """TableOfContents that uses CJK font when available."""
+
+    def __init__(self, has_cjk: bool = False) -> None:
+        super().__init__()
+        self.has_cjk = has_cjk
+
+    def render_toc(self, pdf: FPDF, outline: list) -> None:
+        pdf._use_font("B", 18)
+        pdf.set_text_color(255, 90, 31)
+        pdf.cell(0, 12, "目  录", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(8)
+
+        for section in outline:
+            level = section.level
+            indent = level * 8
+            pdf.set_x(pdf.l_margin + indent)
+            pdf._use_font("B" if level == 0 else "", 11 if level == 0 else 10)
+            pdf.set_text_color(40, 40, 40)
+
+            name = section.name
+            page = section.page_number
+
+            # Draw dotted line between name and page number
+            name_w = pdf.get_string_width(name) + 2
+            page_str = str(page)
+            page_w = pdf.get_string_width(page_str) + 2
+            avail = pdf.w - pdf.r_margin - pdf.get_x() - page_w
+
+            pdf.cell(name_w, 7, name)
+
+            if name_w < avail:
+                # Draw dots
+                dot_w = pdf.get_string_width(".")
+                x_start = pdf.get_x()
+                num_dots = int((avail - name_w) / dot_w)
+                dot_str = " " + "." * num_dots
+                pdf._use_font("", 8)
+                pdf.set_text_color(160, 160, 160)
+                pdf.cell(avail - name_w, 7, dot_str)
+                pdf._use_font("B" if level == 0 else "", 11 if level == 0 else 10)
+                pdf.set_text_color(40, 40, 40)
+
+            # Link the page number to the actual page
+            link = pdf.add_link(page=page)
+            pdf.cell(page_w, 7, page_str, align="R", link=link)
+            pdf.ln(7)
+
+
+# ── PDF class ───────────────────────────────────────────────────────────────
 
 class _ReportPDF(FPDF):
     def __init__(self, ticker: str, trade_date: str, signal: str) -> None:
@@ -94,6 +165,8 @@ class _ReportPDF(FPDF):
         self.set_text_color(120, 120, 120)
         self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
 
+    # ── Cover page ─────────────────────────────────────────────────────────
+
     def add_cover(self) -> None:
         self.add_page()
         self.ln(60)
@@ -115,10 +188,17 @@ class _ReportPDF(FPDF):
         self.cell(0, 10, f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}", align="C")
         self.ln(20)
 
-        r, g, b = _signal_color(self.signal)
+        # Signal
+        s = self.signal.upper()
+        if "BUY" in s:
+            r, g, b = 34, 197, 94
+        elif "SELL" in s:
+            r, g, b = 239, 68, 68
+        else:
+            r, g, b = 251, 191, 36
         self._use_font("B", 40)
         self.set_text_color(r, g, b)
-        self.cell(0, 20, self.signal.upper(), align="C")
+        self.cell(0, 20, s, align="C")
         self.ln(20)
 
         self._use_font("", 9)
@@ -131,8 +211,13 @@ class _ReportPDF(FPDF):
             align="C",
         )
 
-    def add_section(self, title: str, content: str) -> None:
+    # ── Section with bookmark ───────────────────────────────────────────────
+
+    def add_section(self, title: str, content: str, level: int = 0) -> None:
+        """Add a section with a PDF bookmark at the given outline level."""
         self.add_page()
+        self.start_section(name=title, level=level)
+
         self._use_font("B", 16)
         self.set_text_color(255, 90, 31)
         self.cell(0, 10, title)
@@ -141,22 +226,38 @@ class _ReportPDF(FPDF):
         cleaned = _strip_think(content)
         self._render_markdown(cleaned)
 
+    def add_subsection(self, title: str, content: str, level: int = 1) -> None:
+        """Add a subsection with a nested PDF bookmark."""
+        # No page break for subsections
+        self.start_section(name=title, level=level)
+        self.ln(4)
+        self._use_font("B", 13)
+        self.set_text_color(255, 90, 31)
+        self.cell(0, 8, title)
+        self.ln(9)
+
+        cleaned = _strip_think(content)
+        self._render_markdown(cleaned)
+
+    # ── Markdown renderer with hyperlink support ───────────────────────────
+
     def _render_markdown(self, text: str) -> None:
-        """Render markdown-formatted text with basic styling."""
+        """Render markdown text with basic styling and clickable hyperlinks."""
         lines = text.split("\n")
         i = 0
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
 
-            # Empty line → small vertical gap
+            # Empty line → small gap
             if not stripped:
                 self.ln(3)
                 i += 1
                 continue
 
-            # Headings: ### → 11pt, ## → 13pt, # → 14pt
+            # Headings
             if stripped.startswith("###"):
+                self.start_section(name=stripped.lstrip("#").strip(), level=2)
                 self._use_font("B", 11)
                 self.set_text_color(50, 50, 50)
                 self.cell(0, 7, stripped.lstrip("#").strip())
@@ -164,6 +265,7 @@ class _ReportPDF(FPDF):
                 i += 1
                 continue
             if stripped.startswith("##"):
+                self.start_section(name=stripped.lstrip("#").strip(), level=1)
                 self._use_font("B", 13)
                 self.set_text_color(40, 40, 40)
                 self.cell(0, 8, stripped.lstrip("#").strip())
@@ -171,6 +273,7 @@ class _ReportPDF(FPDF):
                 i += 1
                 continue
             if stripped.startswith("#"):
+                self.start_section(name=stripped.lstrip("#").strip(), level=1)
                 self._use_font("B", 14)
                 self.set_text_color(255, 90, 31)
                 self.cell(0, 9, stripped.lstrip("#").strip())
@@ -187,7 +290,7 @@ class _ReportPDF(FPDF):
                 i += 1
                 continue
 
-            # Bullet points (-, *, numbered)
+            # Bullet / numbered list
             if re.match(r"^[-*]\s", stripped) or re.match(r"^\d+[.)]\s", stripped):
                 self._use_font("", 10)
                 self.set_text_color(40, 40, 40)
@@ -198,22 +301,19 @@ class _ReportPDF(FPDF):
                     m = re.match(r"^(\d+[.)])\s*(.*)", stripped)
                     bullet = f"  {m.group(1)} "
                     body = m.group(2)
-                body = _strip_md_inline(body)
-                self.multi_cell(0, 5.5, bullet + body)
+                self._render_line_with_links(bullet, body)
                 i += 1
                 continue
 
-            # Table rows (|col|col|) → render as plain text with spacing
+            # Table rows
             if stripped.startswith("|") and stripped.endswith("|"):
-                # Skip separator rows like |---|---|
                 if re.match(r"^\|[-:\s|]+\|$", stripped):
                     i += 1
                     continue
                 self._use_font("", 9)
                 self.set_text_color(60, 60, 60)
                 cells = [c.strip() for c in stripped.strip("|").split("|")]
-                row_text = "    ".join(_strip_md_inline(c) for c in cells)
-                self.multi_cell(0, 5, row_text)
+                self._render_table_row_with_links(cells)
                 i += 1
                 continue
 
@@ -221,7 +321,10 @@ class _ReportPDF(FPDF):
             para_lines = []
             while i < len(lines):
                 ln = lines[i].strip()
-                if not ln or ln.startswith("#") or ln.startswith("|") or re.match(r"^[-*]\s", ln) or re.match(r"^\d+[.)]\s", ln) or ln in ("---", "***", "___"):
+                if (not ln or ln.startswith("#") or ln.startswith("|")
+                        or re.match(r"^[-*]\s", ln)
+                        or re.match(r"^\d+[.)]\s", ln)
+                        or ln in ("---", "***", "___")):
                     break
                 para_lines.append(ln)
                 i += 1
@@ -230,62 +333,168 @@ class _ReportPDF(FPDF):
                 self._use_font("", 10)
                 self.set_text_color(40, 40, 40)
                 para = " ".join(para_lines)
-                para = _strip_md_inline(para)
-                self.multi_cell(0, 5.5, para)
+                self._render_paragraph_with_links(para)
                 self.ln(2)
                 continue
 
             i += 1
 
+    def _render_text_segments(self, segments: list[tuple[str, str | None]]) -> None:
+        """Render a sequence of (text, url_or_none) segments on one line.
+
+        Segments are rendered left-to-right using cell() so they stay on
+        the same line.  If a url is provided the text is clickable and
+        rendered in blue.
+        """
+        for text, url in segments:
+            if not text:
+                continue
+            if url:
+                self.set_text_color(30, 100, 200)
+                self.cell(self.get_string_width(text), 5.5, text, link=url)
+                self.set_text_color(40, 40, 40)
+            else:
+                self.cell(self.get_string_width(text), 5.5, text)
+        self.ln(5.5)
+
+    @staticmethod
+    def _split_rich(text: str) -> list[tuple[str, str | None]]:
+        """Split text with markdown links into [(text, None), (label, url), ...]."""
+        segments: list[tuple[str, str | None]] = []
+        pattern = r"\[(.+?)\]\((.+?)\)"
+        pos = 0
+        for m in re.finditer(pattern, text):
+            plain = text[pos:m.start()]
+            if plain:
+                segments.append((_strip_md_inline(plain), None))
+            label = _strip_md_inline(m.group(1))
+            url = m.group(2)
+            segments.append((label, url))
+            pos = m.end()
+        tail = text[pos:]
+        if tail:
+            segments.append((_strip_md_inline(tail), None))
+        return segments
+
+    def _render_line_with_links(self, prefix: str, body: str) -> None:
+        """Render a line that may contain markdown links as clickable PDF links."""
+        links = re.findall(r"\[(.+?)\]\((.+?)\)", body)
+        if not links:
+            # No links → plain text, use multi_cell for auto-wrap
+            text = _strip_md_inline(body)
+            self.cell(self.get_string_width(prefix), 5.5, prefix)
+            remaining_w = self.w - self.r_margin - self.get_x()
+            if remaining_w < self.get_string_width(text):
+                # Text too long for remaining line, use multi_cell on the remainder
+                self.multi_cell(0, 5.5, text)
+            else:
+                self.cell(0, 5.5, text)
+                self.ln(5.5)
+            return
+
+        # Split into segments and render inline
+        segments: list[tuple[str, str | None]] = []
+        if prefix:
+            segments.append((prefix, None))
+        segments.extend(self._split_rich(body))
+        self._render_text_segments(segments)
+
+    def _render_paragraph_with_links(self, text: str) -> None:
+        """Render a paragraph that may contain markdown links as clickable PDF links."""
+        links = re.findall(r"\[(.+?)\]\((.+?)\)", text)
+        if not links:
+            text = _strip_md_inline(text)
+            self.multi_cell(0, 5.5, text)
+            return
+
+        # Has links → render as inline segments
+        segments = self._split_rich(text)
+        self._render_text_segments(segments)
+
+    def _render_table_row_with_links(self, cells: list[str]) -> None:
+        """Render a table row, each cell may contain links."""
+        col_w = (self.w - self.l_margin - self.r_margin) / max(len(cells), 1)
+        for cell_text in cells:
+            links = re.findall(r"\[(.+?)\]\((.+?)\)", cell_text)
+            clean = _strip_md_inline(cell_text)
+            # Remove markdown link syntax for display text, but keep URL clickable
+            display = re.sub(r"\[(.+?)\]\((.+?)\)", r"\1", clean)
+            if links:
+                # Use the first link as the cell link
+                self.cell(col_w, 5, display, link=links[0][1])
+            else:
+                self.cell(col_w, 5, clean)
+        self.ln(5)
+
+
+# ── Public API ──────────────────────────────────────────────────────────────
 
 def generate_pdf(final_state: dict[str, Any], ticker: str, trade_date: str, signal: str) -> bytes:
-    """Generate a PDF report and return it as bytes."""
+    """Generate a PDF report with ToC, bookmarks, and clickable hyperlinks."""
     pdf = _ReportPDF(ticker, trade_date, signal)
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=20)
 
+    # ── Cover page ─────────────────────────────────────────────────────────
     pdf.add_cover()
 
+    # ── Insert ToC placeholder (2 pages reserved) ─────────────────────────
+    toc = _CjkTableOfContents(has_cjk=pdf._has_cjk)
+    pdf.insert_toc_placeholder(toc.render_toc, pages=2, allow_extra_pages=True)
+
+    # ── Analyst reports ────────────────────────────────────────────────────
     for key, title in _REPORT_SECTIONS:
         content = final_state.get(key, "")
         if content:
-            pdf.add_section(title, str(content))
+            pdf.add_section(title, str(content), level=0)
 
+    # ── Investment debate ──────────────────────────────────────────────────
     debate = final_state.get("investment_debate_state")
     if debate and isinstance(debate, dict):
-        parts = []
-        if debate.get("bull_history"):
-            parts.append(f"=== 多方论点 ===\n{debate['bull_history']}")
-        if debate.get("bear_history"):
-            parts.append(f"\n=== 空方论点 ===\n{debate['bear_history']}")
-        if debate.get("judge_decision"):
-            parts.append(f"\n=== 研究经理决策 ===\n{debate['judge_decision']}")
-        if parts:
-            pdf.add_section("多空辩论", "\n".join(parts))
+        has_any = any(debate.get(k) for k, _ in _DEBATE_SUBSECTIONS)
+        if has_any:
+            pdf.add_page()
+            pdf.start_section(name="多空辩论", level=0)
+            pdf._use_font("B", 16)
+            pdf.set_text_color(255, 90, 31)
+            pdf.cell(0, 10, "多空辩论")
+            pdf.ln(12)
 
+            for key, label in _DEBATE_SUBSECTIONS:
+                sub = debate.get(key, "")
+                if sub:
+                    pdf.add_subsection(label, str(sub), level=1)
+
+    # ── Trader decision ────────────────────────────────────────────────────
     trader_decision = final_state.get("trader_investment_decision", "")
     if trader_decision:
-        pdf.add_section("交易员决策", _strip_think(str(trader_decision)))
+        pdf.add_section("交易员决策", _strip_think(str(trader_decision)), level=0)
 
+    # ── Final investment plan ──────────────────────────────────────────────
     inv_plan = final_state.get("investment_plan", "")
     if inv_plan:
-        pdf.add_section("最终投资建议", _strip_think(str(inv_plan)))
+        pdf.add_section("最终投资建议", _strip_think(str(inv_plan)), level=0)
 
+    # ── Risk debate ────────────────────────────────────────────────────────
     risk = final_state.get("risk_debate_state")
     if risk and isinstance(risk, dict):
-        parts = []
-        for key_name, label in [("aggressive_history", "激进观点"),
-                                 ("conservative_history", "保守观点"),
-                                 ("neutral_history", "中性观点")]:
-            if risk.get(key_name):
-                parts.append(f"=== {label} ===\n{risk[key_name]}")
-        if risk.get("judge_decision"):
-            parts.append(f"\n=== 风控决策 ===\n{risk['judge_decision']}")
-        if parts:
-            pdf.add_section("风控评估", "\n".join(parts))
+        has_any = any(risk.get(k) for k, _ in _RISK_SUBSECTIONS)
+        if has_any:
+            pdf.add_page()
+            pdf.start_section(name="风控评估", level=0)
+            pdf._use_font("B", 16)
+            pdf.set_text_color(255, 90, 31)
+            pdf.cell(0, 10, "风控评估")
+            pdf.ln(12)
 
+            for key, label in _RISK_SUBSECTIONS:
+                sub = risk.get(key, "")
+                if sub:
+                    pdf.add_subsection(label, str(sub), level=1)
+
+    # ── Final decision ─────────────────────────────────────────────────────
     final_decision = final_state.get("final_trade_decision", "")
     if final_decision:
-        pdf.add_section("最终决策", _strip_think(str(final_decision)))
+        pdf.add_section("最终决策", _strip_think(str(final_decision)), level=0)
 
     return bytes(pdf.output())
