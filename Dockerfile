@@ -17,10 +17,13 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Install CJK fonts for PDF generation (best-effort; runtime auto-download as fallback)
-RUN apt-get update && \
-    (apt-get install -y --no-install-recommends fonts-noto-cjk || true) && \
-    rm -rf /var/lib/apt/lists/*
+# Install CJK font for PDF generation at build time
+# python:3.12-slim has no apt fonts-noto-cjk (Debian trixie), no curl — use Python to download.
+# NotoSansSC-Regular.ttf (~10 MB) is baked into the image; no runtime download needed.
+ARG NOTO_SANS_SC_URL=https://fonts.gstatic.com/s/notosanssc/v40/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYw.ttf
+RUN mkdir -p /usr/share/fonts/truetype/noto && \
+    python3 -c "import urllib.request; urllib.request.urlretrieve('${NOTO_SANS_SC_URL}', '/usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf')" && \
+    [ "$(stat -c%s /usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf)" -gt 1000000 ]
 
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
