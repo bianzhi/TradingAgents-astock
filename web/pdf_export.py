@@ -22,18 +22,93 @@ from fpdf.outline import TableOfContents
 # ── CJK font detection ──────────────────────────────────────────────────────
 
 _FONT_CANDIDATES = [
+    # macOS
     "/System/Library/Fonts/PingFang.ttc",
     "/System/Library/Fonts/STHeiti Light.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+    # Debian/Ubuntu: fonts-noto-cjk
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
     "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf",
     "/usr/share/fonts/noto-cjk/NotoSansCJKsc-Regular.otf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    # Alpine: font-noto-cjk
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    # CentOS/RHEL
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
 ]
+
+_CJK_FONT_PATTERNS = ("*CJK*", "*NotoSansSC*", "*PingFang*", "*STHeiti*")
+_CJK_FONT_DIRS = ("/usr/share/fonts", "/System/Library/Fonts", "/Library/Fonts")
 
 
 def _find_cjk_font() -> str | None:
+    """Find a CJK-capable font file on the system.
+
+    Search order:
+      1. Hardcoded candidate paths (most common locations)
+      2. Recursive glob under common font directories
+      3. Download NotoSansSC from Google Fonts as last resort (cached)
+    """
+    # 1. Check known paths
     for path in _FONT_CANDIDATES:
-        if Path(path).exists():
+        if Path(path).is_file():
             return path
+
+    # 2. Glob under font directories
+    for font_dir in _CJK_FONT_DIRS:
+        base = Path(font_dir)
+        if not base.is_dir():
+            continue
+        for pattern in _CJK_FONT_PATTERNS:
+            for match in base.rglob(f"{pattern}.ttf"):
+                return str(match)
+            for match in base.rglob(f"{pattern}.ttc"):
+                return str(match)
+            for match in base.rglob(f"{pattern}.otf"):
+                return str(match)
+
+    # 3. Download NotoSansSC as last resort (cache in /tmp)
+    return _download_cjk_font()
+
+
+def _download_cjk_font() -> str | None:
+    """Download NotoSansSC from Google Fonts CDN and cache it.
+
+    Cache priority:
+      1. /home/appuser/.tradingagents/fonts/  (persistent volume in Docker)
+      2. /tmp/tradingagents_fonts/            (fallback)
+    """
+    import tempfile
+    import urllib.request
+
+    _GSTATIC_URL = (
+        "https://fonts.gstatic.com/s/notosanssc/v40/"
+        "k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYw.ttf"
+    )
+
+    # Prefer volume-mounted directory for persistence across container restarts
+    cache_dirs = [
+        Path("/home/appuser/.tradingagents/fonts"),
+        Path(tempfile.gettempdir()) / "tradingagents_fonts",
+    ]
+
+    for cache_dir in cache_dirs:
+        cache_path = cache_dir / "NotoSansSC-Regular.ttf"
+        if cache_path.is_file() and cache_path.stat().st_size > 1_000_000:
+            return str(cache_path)
+
+    # Download to first writable directory
+    for cache_dir in cache_dirs:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = cache_dir / "NotoSansSC-Regular.ttf"
+            urllib.request.urlretrieve(_GSTATIC_URL, str(cache_path))
+            if cache_path.stat().st_size > 1_000_000:
+                return str(cache_path)
+            cache_path.unlink(missing_ok=True)
+        except Exception:
+            continue
+
     return None
 
 
@@ -140,9 +215,19 @@ class _ReportPDF(FPDF):
 
         font_path = _find_cjk_font()
         if font_path:
-            self.add_font("CJK", "", font_path, uni=True)
-            self.add_font("CJK", "B", font_path, uni=True)
-            self._has_cjk = True
+            is_ttc = font_path.lower().endswith(".ttc")
+            try:
+                if is_ttc:
+                    # TTC files contain multiple fonts; try font number 0 (Regular)
+                    self.add_font("CJK", "", font_path, collection_font_number=0)
+                    self.add_font("CJK", "B", font_path, collection_font_number=1)
+                else:
+                    self.add_font("CJK", "", font_path)
+                    self.add_font("CJK", "B", font_path)
+                self._has_cjk = True
+            except Exception:
+                # If font loading fails, fall back gracefully
+                self._has_cjk = False
 
     def _use_font(self, style: str = "", size: int = 10) -> None:
         if self._has_cjk:

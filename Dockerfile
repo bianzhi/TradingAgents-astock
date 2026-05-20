@@ -17,6 +17,11 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Install CJK fonts for PDF generation (best-effort; runtime auto-download as fallback)
+RUN apt-get update && \
+    (apt-get install -y --no-install-recommends fonts-noto-cjk || true) && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
