@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 import json
 from datetime import datetime, timedelta
@@ -420,7 +421,16 @@ class TradingAgentsGraph:
 
         # Save to file. Reject ticker values that would escape the
         # results directory when joined as a path component.
-        safe_ticker = safe_ticker_component(self.ticker)
+        try:
+            safe_ticker = safe_ticker_component(self.ticker)
+        except Exception:
+            # resolve_ticker may fail (e.g. mootdx unreachable); fall back
+            # to the raw value sanitised for filesystem use.
+            safe_ticker = re.sub(r"[^\w]", "_", self.ticker, flags=re.UNICODE)[:32]
+            logger.warning(
+                "safe_ticker_component failed for %r, using fallback %r",
+                self.ticker, safe_ticker,
+            )
         directory = Path(self.config["results_dir"]) / safe_ticker / "TradingAgentsStrategy_logs"
         directory.mkdir(parents=True, exist_ok=True)
 

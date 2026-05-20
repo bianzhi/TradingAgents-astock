@@ -1,13 +1,30 @@
 services:
-  tradingagents:
+  tradingagents-web:
     build: .
+    container_name: tradingagents-web
     env_file:
       - .env
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  # ── Optional: CLI mode (no web UI) ──────────────────────────────────────────
+  tradingagents-cli:
+    build: .
+    container_name: tradingagents-cli
+    env_file:
+      - .env
+    volumes:
+      - tradingagents_data:/home/appuser/.tradingagents
+    entrypoint: ["python", "main.py"]
+    profiles:
+      - cli
     tty: true
     stdin_open: true
 
+  # ── Optional: Ollama local LLM ──────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
     volumes:
@@ -23,6 +40,8 @@ services:
       - LLM_PROVIDER=ollama
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
+    ports:
+      - "8501:8501"
     depends_on:
       - ollama
     tty: true
