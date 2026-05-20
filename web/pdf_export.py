@@ -425,22 +425,43 @@ class _ReportPDF(FPDF):
             i += 1
 
     def _render_text_segments(self, segments: list[tuple[str, str | None]]) -> None:
-        """Render a sequence of (text, url_or_none) segments on one line.
+        """Render a sequence of (text, url_or_none) segments with auto-wrap.
 
-        Segments are rendered left-to-right using cell() so they stay on
-        the same line.  If a url is provided the text is clickable and
-        rendered in blue.
+        Segments are rendered using cell() for inline placement.  When the
+        remaining horizontal space is insufficient, a line break is inserted
+        before continuing.  This prevents the "not enough horizontal space"
+        FPDFException.
         """
         for text, url in segments:
             if not text:
                 continue
-            if url:
-                self.set_text_color(30, 100, 200)
-                self.cell(self.get_string_width(text), 5.5, text, link=url)
-                self.set_text_color(40, 40, 40)
+            remaining_w = self.w - self.r_margin - self.get_x()
+            text_w = self.get_string_width(text)
+            # If current segment doesn't fit, wrap to next line first
+            if text_w > remaining_w and self.get_x() > self.l_margin:
+                self.ln(5.5)
+                self.set_x(self.l_margin)
+                remaining_w = self.w - self.r_margin - self.l_margin
+            # Segment is wider than a full line → use multi_cell for auto-wrap
+            if text_w > remaining_w:
+                if url:
+                    self.set_text_color(30, 100, 200)
+                    self.multi_cell(0, 5.5, text, link=url)
+                    self.set_text_color(40, 40, 40)
+                else:
+                    self.multi_cell(0, 5.5, text)
+                # multi_cell resets x to l_margin; re-position for next segment
+                self.set_x(self.l_margin)
             else:
-                self.cell(self.get_string_width(text), 5.5, text)
+                if url:
+                    self.set_text_color(30, 100, 200)
+                    self.cell(text_w, 5.5, text, link=url)
+                    self.set_text_color(40, 40, 40)
+                else:
+                    self.cell(text_w, 5.5, text)
         self.ln(5.5)
+        # Ensure x is at left margin for next element
+        self.set_x(self.l_margin)
 
     @staticmethod
     def _split_rich(text: str) -> list[tuple[str, str | None]]:
@@ -463,25 +484,19 @@ class _ReportPDF(FPDF):
 
     def _render_line_with_links(self, prefix: str, body: str) -> None:
         """Render a line that may contain markdown links as clickable PDF links."""
-        links = re.findall(r"\[(.+?)\]\((.+?)\)", body)
+        # Combine prefix + body so multi_cell handles wrapping in one call
+        combined = prefix + body if prefix else body
+        links = re.findall(r"\[(.+?)\]\((.+?)\)", combined)
         if not links:
             # No links → plain text, use multi_cell for auto-wrap
-            text = _strip_md_inline(body)
-            self.cell(self.get_string_width(prefix), 5.5, prefix)
-            remaining_w = self.w - self.r_margin - self.get_x()
-            if remaining_w < self.get_string_width(text):
-                # Text too long for remaining line, use multi_cell on the remainder
-                self.multi_cell(0, 5.5, text)
-            else:
-                self.cell(0, 5.5, text)
-                self.ln(5.5)
+            text = _strip_md_inline(combined)
+            self.multi_cell(0, 5.5, text)
+            # multi_cell leaves x at right margin — reset to left margin
+            self.set_x(self.l_margin)
             return
 
-        # Split into segments and render inline
-        segments: list[tuple[str, str | None]] = []
-        if prefix:
-            segments.append((prefix, None))
-        segments.extend(self._split_rich(body))
+        # Has links → render as inline segments
+        segments = self._split_rich(combined)
         self._render_text_segments(segments)
 
     def _render_paragraph_with_links(self, text: str) -> None:
@@ -490,6 +505,8 @@ class _ReportPDF(FPDF):
         if not links:
             text = _strip_md_inline(text)
             self.multi_cell(0, 5.5, text)
+            # multi_cell leaves x at right margin — reset to left margin
+            self.set_x(self.l_margin)
             return
 
         # Has links → render as inline segments
@@ -504,11 +521,16 @@ class _ReportPDF(FPDF):
             clean = _strip_md_inline(cell_text)
             # Remove markdown link syntax for display text, but keep URL clickable
             display = re.sub(r"\[(.+?)\]\((.+?)\)", r"\1", clean)
-            if links:
-                # Use the first link as the cell link
-                self.cell(col_w, 5, display, link=links[0][1])
+            # Truncate if text is wider than column to avoid FPDFException
+            while self.get_string_width(display) > col_w - 1 and len(display) > 1:
+                display = display[:-1]
+            if display and self.get_string_width(display) < col_w:
+                if links:
+                    self.cell(col_w, 5, display, link=links[0][1])
+                else:
+                    self.cell(col_w, 5, clean[:len(display)])
             else:
-                self.cell(col_w, 5, clean)
+                self.cell(col_w, 5, "")
         self.ln(5)
 
 
