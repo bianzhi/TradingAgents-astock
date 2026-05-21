@@ -635,19 +635,44 @@ def _fetch_kline(code: str, level: str = "daily",
 
 
 def _resample_kline(df: pd.DataFrame, target_level: str) -> pd.DataFrame:
-    """将日线K线重采样为周线/月线。
+    """将K线数据重采样为更高级别（日线→周线/月线，或分钟级→30分钟等）。
 
     Args:
-        df: 日线 DataFrame，需包含 Date/Open/High/Low/Close/Volume 列
-        target_level: "weekly" 或 "monthly"
+        df: 源 DataFrame，需包含 Date/Open/High/Low/Close/Volume 列
+        target_level: 目标级别: "30min"/"60min"/"weekly" 或 "monthly"
 
     Returns:
         重采样后的 DataFrame
     """
-    if df.empty or target_level not in ("weekly", "monthly"):
+    if df.empty:
+        return df
+
+    # 分钟级重采样
+    _MINUTE_RESAMPLE = {
+        "30min": "30min",
+        "60min": "60min",
+    }
+    if target_level in _MINUTE_RESAMPLE:
+        df = df.copy()
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date")
+        rule = _MINUTE_RESAMPLE[target_level]
+        agg = {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }
+        resampled = df.resample(rule).agg(agg).dropna()
+        return resampled.reset_index()
+
+    # 日线 → 周线/月线
+    if target_level not in ("weekly", "monthly"):
         return df
 
     df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
     df = df.set_index("Date")
 
     rule = "W-MON" if target_level == "weekly" else "ME"
@@ -813,15 +838,19 @@ def sync_stock_data(code: str, level: str = "daily",
     # Save CSV
     df.to_csv(cache_file, index=False, encoding="utf-8")
 
-    # Save meta
+    # Save meta — 分钟级日期含时分，日线及以上只含日期
     import json as _json_mod
+    is_minute = level.endswith("min")
+    fmt = "%Y-%m-%d %H:%M" if is_minute else "%Y-%m-%d"
+    date_min = pd.to_datetime(df["Date"].min())
+    date_max = pd.to_datetime(df["Date"].max())
     meta = {
         "code": code,
         "level": level,
         "rows": len(df),
         "date_range": [
-            df["Date"].min().strftime("%Y-%m-%d"),
-            df["Date"].max().strftime("%Y-%m-%d"),
+            date_min.strftime(fmt),
+            date_max.strftime(fmt),
         ],
         "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": source_name,
@@ -919,6 +948,263 @@ def delete_cache(code: str, level: str | None = None) -> bool:
         if os.path.exists(cache_dir):
             for f in os.listdir(cache_dir):
                 if f.startswith(f"{code}-astock-") and (
+                    f.endswith(".csv") or f.endswith("-meta.json")
+                ):
+                    os.remove(os.path.join(cache_dir, f))
+                    deleted = True
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+#  Sector / Board data sync (板块数据同步)
+# ---------------------------------------------------------------------------
+
+def _sector_cache_path(sector_code: str, level: str = "daily") -> str:
+    """Return the K-line CSV path for a sector code and level."""
+    return os.path.join(_cache_dir(), f"{sector_code}-sector-{level}.csv")
+
+
+def _sector_meta_path(sector_code: str, level: str = "daily") -> str:
+    """Return the sector metadata JSON path."""
+    return os.path.join(_cache_dir(), f"{sector_code}-sector-{level}-meta.json")
+
+
+def get_sector_list(sector_type: str = "industry") -> list[dict]:
+    """获取东方财富行业/概念板块列表。
+
+    Args:
+        sector_type: "industry" (行业板块) 或 "concept" (概念板块)
+
+    Returns:
+        list of {"code": "BK0428", "name": "酿酒行业", "change_pct": 1.23, ...}
+    """
+    fs_map = {"industry": "m:90+t:2", "concept": "m:90+t:3"}
+    fs = fs_map.get(sector_type, "m:90+t:2")
+
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1",
+        "pz": "500",
+        "po": "1",
+        "np": "1",
+        "fltt": "2",
+        "invt": "2",
+        "fs": fs,
+        "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141",
+    }
+
+    results = []
+    page = 1
+    while True:
+        params["pn"] = str(page)
+        try:
+            r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
+            r.raise_for_status()
+        except Exception:
+            try:
+                r = _requests.get(url, params=params, headers={"User-Agent": _UA},
+                                  timeout=15, verify=False)
+                r.raise_for_status()
+            except Exception:
+                break
+        d = r.json()
+        items = d.get("data", {}).get("diff", [])
+        if not items:
+            break
+        for item in items:
+            code = item.get("f12", "")
+            name = item.get("f14", "")
+            if not code or not name:
+                continue
+            results.append({
+                "code": code,
+                "name": name,
+                "change_pct": item.get("f3", 0),
+                "price": item.get("f2", 0),
+                "up_count": item.get("f104", 0),
+                "down_count": item.get("f105", 0),
+                "leader": item.get("f140", ""),
+            })
+        total = d.get("data", {}).get("total", 0)
+        if page * 500 >= total:
+            break
+        page += 1
+    return results
+
+
+def _eastmoney_sector_kline(
+    sector_code: str, level: str = "daily",
+    start_date: str = None, datalen: int = 10000,
+) -> pd.DataFrame:
+    """从东方财富获取板块K线数据。
+
+    板块secid格式: 90.{code} (如 90.BK0428)
+    """
+    secid = f"90.{sector_code}"
+    klt = _EASTMONEY_KLT.get(level, 101)
+
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "klt": str(klt),
+        "fqt": "1",
+        "lmt": str(datalen),
+        "end": "20500101",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+    }
+
+    try:
+        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        try:
+            r = _requests.get(url, params=params, headers={"User-Agent": _UA},
+                              timeout=30, verify=False)
+            r.raise_for_status()
+        except Exception:
+            logger.warning("Eastmoney sector kline failed for %s/%s: %s", sector_code, level, e)
+            return pd.DataFrame()
+
+    d = r.json()
+    klines = d.get("data", {}).get("klines", [])
+    if not klines:
+        return pd.DataFrame()
+
+    rows = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        rows.append({
+            "Date": parts[0],
+            "Open": float(parts[1]),
+            "Close": float(parts[2]),
+            "High": float(parts[3]),
+            "Low": float(parts[4]),
+            "Volume": int(float(parts[5])),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    if start_date:
+        df = df[df["Date"] >= pd.to_datetime(start_date)]
+
+    return df
+
+
+def sync_sector_data(
+    sector_code: str,
+    sector_name: str = "",
+    level: str = "daily",
+    datalen: int = 10000,
+    start_date: str = None,
+) -> dict:
+    """同步板块K线数据到本地缓存。
+
+    Args:
+        sector_code: 板块代码 (如 BK0428)
+        sector_name: 板块名称 (如 酿酒行业)，仅用于日志
+        level: K线级别
+        datalen: 最大K线数量
+        start_date: 起始日期
+
+    Returns:
+        同步结果 dict (与 sync_stock_data 格式一致)
+    """
+    cache_file = _sector_cache_path(sector_code, level)
+    meta_file = _sector_meta_path(sector_code, level)
+
+    if not start_date:
+        from .config import get_config
+        config = get_config()
+        start_date = config.get("kline_start_date", "2024-01-01")
+
+    # 板块K线只有东财源
+    df = _eastmoney_sector_kline(
+        sector_code, level=level, start_date=start_date, datalen=datalen,
+    )
+
+    if df.empty:
+        return {
+            "code": sector_code, "level": level, "rows": 0,
+            "date_range": [], "source": "none",
+            "status": "error", "error": "东方财富无法获取该板块K线数据",
+        }
+
+    df.to_csv(cache_file, index=False, encoding="utf-8")
+
+    import json as _json_mod
+    is_minute = level.endswith("min")
+    fmt = "%Y-%m-%d %H:%M" if is_minute else "%Y-%m-%d"
+    date_min = pd.to_datetime(df["Date"].min())
+    date_max = pd.to_datetime(df["Date"].max())
+    meta = {
+        "code": sector_code,
+        "name": sector_name,
+        "level": level,
+        "rows": len(df),
+        "date_range": [
+            date_min.strftime(fmt),
+            date_max.strftime(fmt),
+        ],
+        "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "eastmoney",
+        "data_type": "sector",
+        "datalen": datalen,
+        "start_date": start_date,
+    }
+    with open(meta_file, "w", encoding="utf-8") as f:
+        _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return {
+        "code": sector_code,
+        "name": sector_name,
+        "level": level,
+        "rows": len(df),
+        "date_range": meta["date_range"],
+        "source": "eastmoney",
+        "status": "ok",
+        "error": None,
+    }
+
+
+def get_cached_sectors() -> list[dict]:
+    """列出所有已缓存的板块数据。"""
+    cache_dir = _cache_dir()
+    if not os.path.exists(cache_dir):
+        return []
+
+    results = []
+    for f in os.listdir(cache_dir):
+        if not f.endswith("-sector-meta.json"):
+            continue
+        try:
+            with open(os.path.join(cache_dir, f), encoding="utf-8") as fh:
+                meta = _json.load(fh)
+            meta["data_type"] = "sector"
+            results.append(meta)
+        except Exception:
+            pass
+    return results
+
+
+def delete_sector_cache(sector_code: str, level: str | None = None) -> bool:
+    """删除指定板块的缓存数据。"""
+    deleted = False
+    if level:
+        for path in [_sector_cache_path(sector_code, level), _sector_meta_path(sector_code, level)]:
+            if os.path.exists(path):
+                os.remove(path)
+                deleted = True
+    else:
+        cache_dir = _cache_dir()
+        if os.path.exists(cache_dir):
+            for f in os.listdir(cache_dir):
+                if f.startswith(f"{sector_code}-sector-") and (
                     f.endswith(".csv") or f.endswith("-meta.json")
                 ):
                     os.remove(os.path.join(cache_dir, f))
