@@ -35,6 +35,10 @@ from tradingagents.dataflows.a_stock import (  # noqa: E402
     get_sector_list,
     get_cached_sectors,
     delete_sector_cache,
+    sync_index_data,
+    get_index_list,
+    get_cached_indices,
+    delete_index_cache,
 )
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -328,7 +332,9 @@ def _render_data_sync_tab() -> None:
         unsafe_allow_html=True,
     )
 
-    sync_tab1, sync_tab2, sync_tab3 = st.tabs(["📈 个股同步", "📊 板块同步", "📂 缓存管理"])
+    sync_tab1, sync_tab2, sync_tab3, sync_tab4 = st.tabs(
+        ["📈 个股同步", "📊 指数同步", "🏭 板块同步", "📂 缓存管理"]
+    )
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Tab 1: 个股同步
@@ -380,8 +386,11 @@ def _render_data_sync_tab() -> None:
                 resolved_code = None
 
             if resolved_code:
-                for lvl_label in selected_levels:
+                for i, lvl_label in enumerate(selected_levels):
                     level = _LEVEL_OPTIONS[lvl_label]
+                    # 多级别间加延时，避免连续请求触发限流
+                    if i > 0:
+                        time.sleep(0.5)
                     with st.spinner(f"同步 {resolved_code} {lvl_label}..."):
                         result = sync_stock_data(
                             resolved_code,
@@ -454,9 +463,113 @@ def _render_data_sync_tab() -> None:
                             st.warning(f"⚠️ {resolved_code} · {lvl_label} · {result.get('error', '未知')}")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Tab 2: 板块同步
+    # Tab 2: 指数同步
     # ═══════════════════════════════════════════════════════════════════════════
     with sync_tab2:
+        st.caption("同步主要指数K线数据（沪指/深成指/创业板/科创板/北京等）")
+
+        # 预置指数列表
+        index_list = get_index_list()
+
+        # 显示五大核心指数
+        core_indices = [i for i in index_list if i["code"] in
+                        ("000001", "399001", "399006", "000688", "899050")]
+        other_indices = [i for i in index_list if i not in core_indices]
+
+        index_names = [f"{i['name']} ({i['code']})" for i in index_list]
+        selected_indices = st.multiselect(
+            "选择指数（默认五大核心指数）",
+            options=index_names,
+            default=[f"{i['name']} ({i['code']})" for i in core_indices],
+            key="index_select",
+        )
+
+        col_id, col_il = st.columns([2, 1])
+        with col_id:
+            index_start = st.date_input(
+                "指数起始日期",
+                value=_DEFAULT_START,
+                key="index_start_date",
+            )
+        with col_il:
+            index_datalen = st.number_input(
+                "K线数量上限",
+                min_value=100,
+                max_value=10000,
+                value=10000,
+                step=500,
+                key="index_datalen",
+            )
+
+        index_levels = st.multiselect(
+            "指数K线级别",
+            options=list(_LEVEL_OPTIONS.keys()),
+            default=["日线", "30分钟"],
+            key="index_levels",
+        )
+
+        if st.button("🚀 同步指数", type="primary", use_container_width=True,
+                      disabled=not selected_indices or not index_levels):
+            for i_idx, sel in enumerate(selected_indices):
+                code = sel.split("(")[-1].rstrip(")")
+                name = sel.split("(")[0].strip()
+
+                for j, lvl_label in enumerate(index_levels):
+                    level = _LEVEL_OPTIONS[lvl_label]
+                    # 多指数/多级别间加延时
+                    if i_idx > 0 or j > 0:
+                        time.sleep(0.5)
+                    with st.spinner(f"同步 {name} {lvl_label}..."):
+                        result = sync_index_data(
+                            code,
+                            index_name=name,
+                            level=level,
+                            datalen=index_datalen,
+                            start_date=str(index_start) if index_start else None,
+                        )
+                    if result["status"] == "ok":
+                        st.success(
+                            f"✅ **{name}** · {lvl_label} · "
+                            f"{result['rows']} 根 · "
+                            f"来源:{result['source']} · "
+                            f"{result['date_range'][0]} ~ {result['date_range'][1]}"
+                        )
+                    else:
+                        st.error(f"❌ **{name}** · {lvl_label} · {result.get('error', '未知')}")
+
+        # 一键同步核心指数
+        st.markdown("---")
+        with st.expander("⚡ 一键同步五大核心指数", expanded=False):
+            st.markdown(" · ".join(f"**{i['name']}** ({i['code']})" for i in core_indices))
+            quick_index_levels = st.multiselect(
+                "级别",
+                options=list(_LEVEL_OPTIONS.keys()),
+                default=["日线"],
+                key="index_quick_levels",
+            )
+            if st.button("一键同步核心指数", type="primary", disabled=not quick_index_levels):
+                for i_idx, idx in enumerate(core_indices):
+                    for j, lvl_label in enumerate(quick_index_levels):
+                        level = _LEVEL_OPTIONS[lvl_label]
+                        if i_idx > 0 or j > 0:
+                            time.sleep(0.5)
+                        with st.spinner(f"同步 {idx['name']} {lvl_label}..."):
+                            result = sync_index_data(
+                                idx["code"],
+                                index_name=idx["name"],
+                                level=level,
+                                datalen=index_datalen,
+                                start_date=str(index_start) if index_start else None,
+                            )
+                        if result["status"] == "ok":
+                            st.success(f"✅ {idx['name']} · {lvl_label} · {result['rows']}根")
+                        else:
+                            st.warning(f"⚠️ {idx['name']} · {lvl_label} · 失败")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Tab 3: 板块同步
+    # ═══════════════════════════════════════════════════════════════════════════
+    with sync_tab3:
         st.caption("从东方财富同步行业/概念板块K线数据到本地缓存")
 
         sector_type = st.radio(
@@ -574,14 +687,15 @@ def _render_data_sync_tab() -> None:
                                 st.warning(f"⚠️ {s['name']} · {lvl_label} · 失败")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Tab 3: 缓存管理
+    # Tab 4: 缓存管理
     # ═══════════════════════════════════════════════════════════════════════════
-    with sync_tab3:
+    with sync_tab4:
         cached_stocks = get_cached_stocks()
+        cached_indices = get_cached_indices()
         cached_sectors = get_cached_sectors()
 
-        if not cached_stocks and not cached_sectors:
-            st.info("暂无缓存数据。请先同步股票或板块数据。")
+        if not cached_stocks and not cached_indices and not cached_sectors:
+            st.info("暂无缓存数据。请先同步股票、指数或板块数据。")
         else:
             # ── Stock cache ──
             if cached_stocks:
@@ -617,9 +731,42 @@ def _render_data_sync_tab() -> None:
                             else:
                                 st.warning(f"未找到 {code} {level_val} 的缓存文件")
 
+            # ── Index cache ──
+            if cached_indices:
+                st.markdown(f"#### 📊 指数缓存（{len(cached_indices)} 条）")
+                for item in cached_indices:
+                    code = item.get("code", "?")
+                    name = item.get("name", "")
+                    level_val = item.get("level", "daily")
+                    rows = item.get("rows", 0)
+                    date_range = item.get("date_range", [])
+                    last_sync = item.get("last_sync", "未知")
+                    source = item.get("source", "未知")
+                    level_cn = _LEVEL_CN_MAP.get(level_val, level_val)
+
+                    col_info, col_action = st.columns([5, 1])
+                    with col_info:
+                        label = f"**{name or code}**"
+                        parts = [f"{label} · {level_cn} · {rows} 根"]
+                        if date_range and len(date_range) == 2:
+                            year_span = _calc_year_span(date_range[0], date_range[1])
+                            parts.append(f"{date_range[0]} ~ {date_range[1]} ({year_span:.1f}年)")
+                        if source:
+                            parts.append(f"来源:{source}")
+                        parts.append(f"同步:{last_sync}")
+                        st.markdown(" · ".join(parts))
+                    with col_action:
+                        if st.button("🗑️", key=f"del_i_{code}_{level_val}",
+                                      help=f"删除 {name or code} {level_cn} 缓存"):
+                            if delete_index_cache(code, level=level_val):
+                                st.success(f"已删除 {name or code} {level_cn}缓存")
+                                st.rerun()
+                            else:
+                                st.warning(f"未找到 {code} {level_val} 的指数缓存")
+
             # ── Sector cache ──
             if cached_sectors:
-                st.markdown(f"#### 📊 板块缓存（{len(cached_sectors)} 条）")
+                st.markdown(f"#### 🏭 板块缓存（{len(cached_sectors)} 条）")
                 for item in cached_sectors:
                     code = item.get("code", "?")
                     name = item.get("name", "")

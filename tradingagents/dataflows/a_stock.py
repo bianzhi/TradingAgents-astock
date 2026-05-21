@@ -22,6 +22,7 @@ import os
 import logging
 import math
 import re as _re
+import time as _time
 import uuid
 import urllib.request
 
@@ -34,16 +35,80 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Major market indices (指数板块)
+# ---------------------------------------------------------------------------
+
+# 预置主要指数：东财 secid 格式为 {market}.{code}
+# market: 1=沪市, 0=深市
+# type: "index" 用于区分指数和个股
+INDEX_SECTORS = [
+    {"code": "000001", "name": "上证指数",   "market": 1, "type": "index"},
+    {"code": "399001", "name": "深证成指",   "market": 0, "type": "index"},
+    {"code": "399006", "name": "创业板指",   "market": 0, "type": "index"},
+    {"code": "000688", "name": "科创50",     "market": 1, "type": "index"},
+    {"code": "899050", "name": "北证50",     "market": 0, "type": "index"},
+    # 更多主要指数
+    {"code": "000300", "name": "沪深300",    "market": 1, "type": "index"},
+    {"code": "000905", "name": "中证500",    "market": 1, "type": "index"},
+    {"code": "000852", "name": "中证1000",   "market": 1, "type": "index"},
+    {"code": "000016", "name": "上证50",     "market": 1, "type": "index"},
+    {"code": "399005", "name": "中小100",    "market": 0, "type": "index"},
+    {"code": "399673", "name": "创业板50",   "market": 0, "type": "index"},
+]
+
+# 快速查找: code -> index info
+_INDEX_MAP: dict[str, dict] = {s["code"]: s for s in INDEX_SECTORS}
+
+# K线请求间隔(秒)，避免连续请求触发限流
+_KLINE_REQUEST_INTERVAL = 0.3
+
+
+# ---------------------------------------------------------------------------
 # Helpers: ticker format & market detection
 # ---------------------------------------------------------------------------
 
 def _get_prefix(code: str) -> str:
-    """6-digit A-stock code -> market prefix for Tencent API."""
+    """6-digit A-stock code -> market prefix (sh/sz/bj) for API calls.
+    
+    Supports regular stocks and index codes.
+    """
+    # 已知指数优先查表
+    idx = _INDEX_MAP.get(code)
+    if idx:
+        return "sh" if idx["market"] == 1 else "sz"
+    # 北交所
+    if code.startswith("8") or code.startswith("4"):
+        return "bj"
+    # 沪市: 6xx 主板, 688/689 科创板, 9xx (B股)
     if code.startswith(("6", "9")):
         return "sh"
-    elif code.startswith("8"):
-        return "bj"
     return "sz"
+
+
+def _eastmoney_secid(code: str) -> str:
+    """6-digit code -> eastmoney secid format '{market}.{code}'.
+    
+    Rules:
+    - Regular stocks: 6xx/688/689 -> 1.{code} (沪), 0xx/3xx -> 0.{code} (深)
+    - Indices: use _INDEX_MAP for market lookup
+    - 8xx/4xx (北交所): 0.{code} (东财对北交所也用0)
+    """
+    idx = _INDEX_MAP.get(code)
+    if idx:
+        return f"{idx['market']}.{code}"
+    # 北交所
+    if code.startswith("8") or code.startswith("4"):
+        return f"0.{code}"
+    # 沪市
+    if code.startswith("6") or code.startswith("9"):
+        return f"1.{code}"
+    # 深市
+    return f"0.{code}"
+
+
+def _is_index_code(code: str) -> bool:
+    """判断代码是否为指数（非个股）。"""
+    return code in _INDEX_MAP
 
 
 def _normalize_ticker(symbol: str) -> str:
@@ -288,18 +353,21 @@ def _eastmoney_kline(code: str, level: str = "daily",
     """从东方财富获取K线数据（支持1分~日线）。
 
     东方财富 push2his K线接口，日线最多10000根，分钟级最优。
+    自动识别指数/个股，使用正确的 secid 和复权参数。
 
     Returns:
         DataFrame with columns: Date, Open, High, Low, Close, Volume.
     """
-    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+    secid = _eastmoney_secid(code)
     klt = _EASTMONEY_KLT.get(level, 101)
+    # 指数不需要复权 (fqt=0)，个股前复权 (fqt=1)
+    fqt = "0" if _is_index_code(code) else "1"
 
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "secid": secid,
         "klt": str(klt),
-        "fqt": "1",  # 前复权
+        "fqt": fqt,
         "lmt": str(datalen),
         "end": "20500101",
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -356,7 +424,7 @@ def _sina_kline(code: str, level: str = "daily",
     Returns:
         DataFrame with columns: Date, Open, High, Low, Close, Volume.
     """
-    prefix = "sh" if code.startswith("6") else "sz"
+    prefix = _get_prefix(code)
     scale = _KLINE_SCALE.get(level, "240")
     url = (
         "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
@@ -407,7 +475,7 @@ def _tencent_kline(code: str, level: str = "daily",
     Returns:
         DataFrame with columns: Date, Open, High, Low, Close, Volume.
     """
-    prefix = "sh" if code.startswith("6") else "sz"
+    prefix = _get_prefix(code)
     # 腾讯 K线 type: 1=1分, 5=5分, 15=15分, 30=30分, 60=60分, day=日线, week=周线
     _TENCENT_TYPE = {
         "1min": "1", "5min": "5", "15min": "15", "30min": "30", "60min": "60",
@@ -416,9 +484,11 @@ def _tencent_kline(code: str, level: str = "daily",
     ktype = _TENCENT_TYPE.get(level, "day")
 
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    # 指数不需要复权
+    qfq = "" if _is_index_code(code) else ",qfq"
     params = {
         "_var": f"kline_{ktype}",
-        "param": f"{prefix}{code},{ktype},,{datalen},1,qfq",
+        "param": f"{prefix}{code},{ktype},,{datalen},1{qfq}",
     }
 
     try:
@@ -444,15 +514,18 @@ def _tencent_kline(code: str, level: str = "daily",
     except (ValueError, _json.JSONDecodeError):
         return pd.DataFrame()
 
-    # 提取数据: d["data"][prefix+code]["qfqday"] 或 ["qfqweek"]
+    # 提取数据: d["data"][prefix+code]["qfqday"] 或 ["qfqweek"] 或 ["day"] / ["week"] (指数)
     raw_data = d.get("data", {})
     if isinstance(raw_data, list):
         # Some responses return data as list — not usable
         return pd.DataFrame()
 
     stock_data = raw_data.get(prefix + code, {})
-    # 前复权数据优先
-    klines = stock_data.get(f"qfq{ktype}", stock_data.get(ktype, []))
+    # 前复权数据优先（个股），指数用原始数据
+    if _is_index_code(code):
+        klines = stock_data.get(ktype, stock_data.get(f"qfq{ktype}", []))
+    else:
+        klines = stock_data.get(f"qfq{ktype}", stock_data.get(ktype, []))
 
     if not klines:
         return pd.DataFrame()
@@ -603,6 +676,8 @@ def _fetch_kline(code: str, level: str = "daily",
         except Exception as e:
             errors.append(f"{src}: {e}")
             logger.warning("K-line source %s failed for %s/%s: %s", src, code, level, e)
+            # 请求间加延时，避免连续请求触发限流
+            _time.sleep(_KLINE_REQUEST_INTERVAL)
             continue
 
     # 所有源都失败了 — 日线 fallback from mootdx (TCP)
@@ -799,6 +874,7 @@ def sync_stock_data(code: str, level: str = "daily",
     # 周线/月线：尝试直接获取失败后，从日线重采样
     if df.empty and level in ("weekly", "monthly"):
         logger.info("Direct %s fetch failed for %s, trying daily resample", level, code)
+        _time.sleep(_KLINE_REQUEST_INTERVAL)  # 间隔避免限流
         df_daily, daily_src = _fetch_kline(
             code, level="daily", start_date=start_date,
             datalen=datalen, sources=sources,
@@ -1039,6 +1115,7 @@ def _eastmoney_sector_kline(
     """从东方财富获取板块K线数据。
 
     板块secid格式: 90.{code} (如 90.BK0428)
+    板块指数不需要复权 (fqt=0)
     """
     secid = f"90.{sector_code}"
     klt = _EASTMONEY_KLT.get(level, 101)
@@ -1047,7 +1124,7 @@ def _eastmoney_sector_kline(
     params = {
         "secid": secid,
         "klt": str(klt),
-        "fqt": "1",
+        "fqt": "0",  # 板块指数不需要复权
         "lmt": str(datalen),
         "end": "20500101",
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -1205,6 +1282,156 @@ def delete_sector_cache(sector_code: str, level: str | None = None) -> bool:
         if os.path.exists(cache_dir):
             for f in os.listdir(cache_dir):
                 if f.startswith(f"{sector_code}-sector-") and (
+                    f.endswith(".csv") or f.endswith("-meta.json")
+                ):
+                    os.remove(os.path.join(cache_dir, f))
+                    deleted = True
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Index data sync (指数K线)
+# ---------------------------------------------------------------------------
+
+def _index_cache_path(index_code: str, level: str = "daily") -> str:
+    """Return the K-line CSV path for an index code and level."""
+    return os.path.join(_cache_dir(), f"{index_code}-index-{level}.csv")
+
+
+def _index_meta_path(index_code: str, level: str = "daily") -> str:
+    """Return the index metadata JSON path."""
+    return os.path.join(_cache_dir(), f"{index_code}-index-{level}-meta.json")
+
+
+def get_index_list() -> list[dict]:
+    """获取预置的主要指数列表。
+
+    Returns:
+        list of {"code": "000001", "name": "上证指数", "market": 1, "type": "index"}
+    """
+    return INDEX_SECTORS.copy()
+
+
+def sync_index_data(
+    index_code: str,
+    index_name: str = "",
+    level: str = "daily",
+    datalen: int = 10000,
+    start_date: str = None,
+) -> dict:
+    """同步指数K线数据到本地缓存。
+
+    指数走 sync_stock_data 的多源获取逻辑（东财/新浪/腾讯/Tushare），
+    但缓存文件单独存放为 {code}-index-{level}.csv，避免与个股缓存混淆。
+
+    Args:
+        index_code: 指数代码 (如 000001, 399001)
+        index_name: 指数名称 (如 上证指数)
+        level: K线级别 (1min/5min/15min/30min/60min/daily/weekly/monthly)
+        datalen: 最大K线数量
+        start_date: 起始日期
+
+    Returns:
+        同步结果 dict
+    """
+    if not start_date:
+        from .config import get_config
+        config = get_config()
+        start_date = config.get("kline_start_date", "2024-01-01")
+
+    # 使用多源获取逻辑（已支持指数 secid/fqt）
+    df, source_name = _fetch_kline(
+        index_code, level=level, start_date=start_date,
+        datalen=datalen,
+    )
+
+    # 周线/月线：尝试从日线重采样
+    if df.empty and level in ("weekly", "monthly"):
+        _time.sleep(_KLINE_REQUEST_INTERVAL)
+        df_daily, daily_src = _fetch_kline(
+            index_code, level="daily", start_date=start_date, datalen=datalen,
+        )
+        if not df_daily.empty:
+            df = _resample_kline(df_daily, level)
+            source_name = f"{daily_src}(resample→{level})"
+
+    if df.empty:
+        return {
+            "code": index_code, "name": index_name, "level": level, "rows": 0,
+            "date_range": [], "source": "none",
+            "status": "error", "error": "所有数据源均无法获取该指数K线数据",
+        }
+
+    cache_file = _index_cache_path(index_code, level)
+    meta_file = _index_meta_path(index_code, level)
+
+    df.to_csv(cache_file, index=False, encoding="utf-8")
+
+    import json as _json_mod
+    is_minute = level.endswith("min")
+    fmt = "%Y-%m-%d %H:%M" if is_minute else "%Y-%m-%d"
+    date_min = pd.to_datetime(df["Date"].min())
+    date_max = pd.to_datetime(df["Date"].max())
+    meta = {
+        "code": index_code,
+        "name": index_name,
+        "level": level,
+        "rows": len(df),
+        "date_range": [date_min.strftime(fmt), date_max.strftime(fmt)],
+        "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source_name,
+        "data_type": "index",
+        "datalen": datalen,
+        "start_date": start_date,
+    }
+    with open(meta_file, "w", encoding="utf-8") as f:
+        _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return {
+        "code": index_code,
+        "name": index_name,
+        "level": level,
+        "rows": len(df),
+        "date_range": meta["date_range"],
+        "source": source_name,
+        "status": "ok",
+        "error": None,
+    }
+
+
+def get_cached_indices() -> list[dict]:
+    """列出所有已缓存的指数数据。"""
+    cache_dir = _cache_dir()
+    if not os.path.exists(cache_dir):
+        return []
+
+    results = []
+    for f in os.listdir(cache_dir):
+        if not f.endswith("-index-meta.json"):
+            continue
+        try:
+            with open(os.path.join(cache_dir, f), encoding="utf-8") as fh:
+                meta = _json.load(fh)
+            meta["data_type"] = "index"
+            results.append(meta)
+        except Exception:
+            pass
+    return results
+
+
+def delete_index_cache(index_code: str, level: str | None = None) -> bool:
+    """删除指定指数的缓存数据。"""
+    deleted = False
+    if level:
+        for path in [_index_cache_path(index_code, level), _index_meta_path(index_code, level)]:
+            if os.path.exists(path):
+                os.remove(path)
+                deleted = True
+    else:
+        cache_dir = _cache_dir()
+        if os.path.exists(cache_dir):
+            for f in os.listdir(cache_dir):
+                if f.startswith(f"{index_code}-index-") and (
                     f.endswith(".csv") or f.endswith("-meta.json")
                 ):
                     os.remove(os.path.join(cache_dir, f))
@@ -2205,14 +2432,7 @@ def get_hot_stocks(
 
 def _northbound_cache_path() -> str:
     """Path to local CSV cache for northbound daily close snapshots."""
-    from .config import get_config
-
-    config = get_config()
-    cache_dir = config.get(
-        "data_cache_dir", os.path.expanduser("~/.tradingagents/cache")
-    )
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, "northbound_daily.csv")
+    return os.path.join(_cache_dir(), "northbound_daily.csv")
 
 
 def _save_northbound_snapshot(date_str: str, hgt: float, sgt: float) -> None:
