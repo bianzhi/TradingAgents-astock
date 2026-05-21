@@ -375,13 +375,14 @@ def _eastmoney_kline(code: str, level: str = "daily",
     }
 
     try:
-        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=30)
+        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=30,
+                          proxies={"http": None, "https": None})
         r.raise_for_status()
     except Exception as e:
         # SSL errors common in some environments — try without verify
         try:
             r = _requests.get(url, params=params, headers={"User-Agent": _UA},
-                              timeout=30, verify=False)
+                              timeout=30, verify=False, proxies={"http": None, "https": None})
             r.raise_for_status()
         except Exception:
             logger.warning("Eastmoney kline failed for %s/%s: %s", code, level, e)
@@ -436,7 +437,19 @@ def _sina_kline(code: str, level: str = "daily",
         "ma": "no",
         "datalen": str(datalen),
     }
-    r = _requests.get(url, params=params, timeout=30)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+        ),
+        "Referer": "https://finance.sina.com.cn/",
+    }
+    r = _requests.get(url, params=params, headers=headers, timeout=30,
+                      proxies={"http": None, "https": None})
+    if r.status_code in (403, 456):
+        # 新浪反爬封禁（456=IP异常访问），直接返回空，不抛异常
+        logger.debug("Sina kline blocked for %s (HTTP %s)", code, r.status_code)
+        return pd.DataFrame()
     r.raise_for_status()
     try:
         data = _json.loads(r.text)
@@ -485,19 +498,34 @@ def _tencent_kline(code: str, level: str = "daily",
 
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     # 指数不需要复权
-    qfq = "" if _is_index_code(code) else ",qfq"
+    # param 格式: {prefix}{code},{ktype},,{datalen},{qfq}
+    # 注意: 2025 起腾讯 API 不再接受中间的 ",1" 参数，
+    #   旧格式 sz300007,day,,200,1,qfq → param error
+    #   新格式 sz300007,day,,,200,qfq → 正常返回
+    # 注意: datalen 过大（>2000）也会报 param error，需截断
+    capped_datalen = min(datalen, 2000)
+    qfq = ",qfq" if not _is_index_code(code) else ""
     params = {
         "_var": f"kline_{ktype}",
-        "param": f"{prefix}{code},{ktype},,{datalen},1{qfq}",
+        "param": f"{prefix}{code},{ktype},,,{capped_datalen}{qfq}",
+    }
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+        ),
     }
 
     try:
-        r = _requests.get(url, params=params, timeout=30)
+        r = _requests.get(url, params=params, headers=headers, timeout=30,
+                          proxies={"http": None, "https": None})
         r.raise_for_status()
     except Exception as e:
         # SSL errors — retry without verify
         try:
-            r = _requests.get(url, params=params, timeout=30, verify=False)
+            r = _requests.get(url, params=params, headers=headers, timeout=30,
+                              verify=False, proxies={"http": None, "https": None})
             r.raise_for_status()
         except Exception:
             logger.warning("Tencent kline failed for %s/%s: %s", code, level, e)
@@ -513,6 +541,10 @@ def _tencent_kline(code: str, level: str = "daily",
         d = _json.loads(json_str)
     except (ValueError, _json.JSONDecodeError):
         return pd.DataFrame()
+
+    # 腾讯 API 返回 {"code":0,"msg":"param error"} 时，说明参数不合法
+    if d.get("msg") and d.get("code", -1) == 0 and not d.get("data"):
+        raise ValueError(f"Tencent API param error (datalen={datalen})")
 
     # 提取数据: d["data"][prefix+code]["qfqday"] 或 ["qfqweek"] 或 ["day"] / ["week"] (指数)
     raw_data = d.get("data", {})

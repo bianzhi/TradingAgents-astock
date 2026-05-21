@@ -16,6 +16,38 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
+# ── Monkey-patch: Starlette 1.0 + Streamlit 1.57 compat ────────────────────
+# Starlette 1.0 changed receive_bytes() to raise KeyError (not RuntimeError)
+# when a text frame arrives. Streamlit's WS handler only caught RuntimeError,
+# causing unhandled KeyError → WS crash → browser black screen.
+from importlib.metadata import version as _pkg_ver
+from packaging.version import Version as _V
+
+_starlette_ver = _V(_pkg_ver("starlette"))
+if _starlette_ver >= _V("1.0"):
+    try:
+        from starlette.websockets import WebSocket as _WS
+
+        _orig_receive_bytes = _WS.receive_bytes
+
+        async def _receive_bytes_compat(self) -> bytes:
+            """Patched receive_bytes that raises RuntimeError (not KeyError) on text frames."""
+            try:
+                return await _orig_receive_bytes(self)
+            except KeyError:
+                # Starlette 1.0+ raises KeyError when a text frame arrives
+                # because message lacks the "bytes" key. Raise RuntimeError
+                # instead so Streamlit's existing except clause catches it.
+                raise RuntimeError(
+                    "Expected binary websocket frame, received text frame"
+                )
+
+        _WS.receive_bytes = _receive_bytes_compat
+    except Exception as _e:
+        import warnings
+        warnings.warn(f"Starlette 1.0 compat patch failed: {_e}", stacklevel=2)
+# ── End monkey-patch ────────────────────────────────────────────────────────
+
 from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
 
 from web.components.progress_panel import render_progress  # noqa: E402
