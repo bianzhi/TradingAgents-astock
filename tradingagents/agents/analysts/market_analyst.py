@@ -19,6 +19,31 @@ def create_market_analyst(llm):
             get_indicators,
         ]
 
+        # Conditionally add chanlun analysis tool if a_stock vendor is configured
+        try:
+            from tradingagents.agents.utils.chanlun_tools import get_chanlun_analysis
+            tools.append(get_chanlun_analysis)
+            chanlun_available = True
+        except Exception:
+            chanlun_available = False
+
+        chanlun_section = ""
+        if chanlun_available:
+            chanlun_section = """
+
+📈 缠论分析（可选高级分析工具）：
+- 可调用 get_chanlun_analysis 获取缠论（缠中说禅理论）视角的技术分析结果
+- 缠论核心概念：
+  - 走势必完美：任何级别的趋势终将完成
+  - 中枢：至少三段连续次级别走势的重叠区间，定义 [ZG, ZD]
+  - 三类买点：一买(趋势底背驰)、二买(一买后回抽)、三买(离开中枢后回试不破ZG)
+  - 三类卖点：一卖(趋势顶背驰)、二卖(一卖后回抽)、三卖(离开中枢后回试不破ZD)
+  - 背驰：MACD辅助判断，黄白线回拉0轴+柱子面积对比
+- 使用场景：当传统指标信号模糊或需验证时，缠论提供基于几何递归的独立分析视角
+- 缠论买卖点与传统指标信号互为验证，不一致时需仔细分析原因
+- 注意：缠论分析需要本地缓存中有充足的日线数据，若返回数据不足提示，不影响传统指标分析
+"""
+
         system_message = (
             """你是一位专注于 A 股市场的技术分析师。你的任务是从以下技术指标中选择最多 **8 个**最相关的指标，为给定的 A 股标的提供技术面分析。选择时应注重指标间的互补性，避免冗余。
 
@@ -65,6 +90,7 @@ MACD 类：
 3. 近 5 日平均成交量 vs 近 20 日平均成交量（判断放量/缩量）
 4. 至少 3 个技术指标的当前数值和多空信号
 5. 关键支撑位和阻力位"""
+            + chanlun_section
             + get_language_instruction()
         )
 

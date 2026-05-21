@@ -312,9 +312,213 @@ def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None
     return df
 
 
+def _sina_kline_full(code: str, datalen: int = 5000) -> pd.DataFrame:
+    """从新浪获取全量日线K线数据（最多5000根，覆盖上市至今）。
+
+    与 _sina_kline_fallback 的区别：
+    - datalen 参数化，默认5000（fallback写死800）
+    - 返回完整 DataFrame，不做日期过滤
+    - 用于一次性全量同步 + 本地缓存
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
+    """
+    prefix = "sh" if code.startswith("6") else "sz"
+    url = (
+        "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        "CN_MarketData.getKLineData"
+    )
+    params = {
+        "symbol": f"{prefix}{code}",
+        "scale": "240",  # daily
+        "ma": "no",
+        "datalen": str(datalen),
+    }
+    r = _requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = _json.loads(r.text)
+
+    if not data:
+        return pd.DataFrame()
+
+    rows = []
+    for item in data:
+        rows.append({
+            "Date": item["day"],
+            "Open": float(item["open"]),
+            "High": float(item["high"]),
+            "Low": float(item["low"]),
+            "Close": float(item["close"]),
+            "Volume": int(item["volume"]),
+        })
+
+    df = pd.DataFrame(rows)
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df
+
+
 # ---------------------------------------------------------------------------
 # OHLCV loading with cache (mootdx -> CSV)
 # ---------------------------------------------------------------------------
+
+def _cache_dir() -> str:
+    """Return the data cache directory, creating it if needed."""
+    from .config import get_config
+    config = get_config()
+    cache_dir = config.get(
+        "data_cache_dir", os.path.expanduser("~/.tradingagents/cache")
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def _daily_cache_path(code: str) -> str:
+    """Return the daily K-line CSV path for a stock code."""
+    return os.path.join(_cache_dir(), f"{code}-astock-daily.csv")
+
+
+def _daily_meta_path(code: str) -> str:
+    """Return the daily K-line metadata JSON path."""
+    return os.path.join(_cache_dir(), f"{code}-astock-daily-meta.json")
+
+
+def sync_stock_data(code: str, datalen: int = 5000) -> dict:
+    """全量同步单只股票的日线数据到本地缓存。
+
+    使用新浪HTTP API获取历史数据（支持最多5000根K线），
+    存储到CSV文件 + 元信息JSON。
+
+    Args:
+        code: 6位股票代码
+        datalen: 拉取的K线数量，默认5000
+
+    Returns:
+        同步结果 dict:
+        {
+            "code": "300750",
+            "rows": 3200,
+            "date_range": ["2008-06-12", "2025-06-15"],
+            "status": "ok" | "error",
+            "error": None | "error message"
+        }
+    """
+    code = _normalize_ticker(code)
+    cache_file = _daily_cache_path(code)
+    meta_file = _daily_meta_path(code)
+
+    try:
+        df = _sina_kline_full(code, datalen=datalen)
+        if df.empty:
+            # Try mootdx fallback
+            try:
+                client = _get_mootdx_client()
+                raw = client.bars(symbol=code, category=4, offset=800)
+                if raw is not None and not raw.empty:
+                    raw = raw.drop(
+                        columns=["datetime", "year", "month", "day", "hour", "minute"],
+                        errors="ignore",
+                    )
+                    raw = raw.reset_index()
+                    raw = raw.rename(columns={
+                        "datetime": "Date", "open": "Open", "close": "Close",
+                        "high": "High", "low": "Low", "volume": "Volume",
+                    })
+                    df = raw[["Date", "Open", "High", "Low", "Close", "Volume"]]
+                    df["Date"] = pd.to_datetime(df["Date"])
+            except Exception:
+                pass
+
+        if df.empty:
+            return {"code": code, "rows": 0, "date_range": [], "status": "error",
+                    "error": "无法从新浪/mootdx获取数据"}
+
+        # Save CSV
+        df.to_csv(cache_file, index=False, encoding="utf-8")
+
+        # Save meta
+        import json as _json_mod
+        meta = {
+            "code": code,
+            "rows": len(df),
+            "date_range": [
+                df["Date"].min().strftime("%Y-%m-%d"),
+                df["Date"].max().strftime("%Y-%m-%d"),
+            ],
+            "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "sina",
+            "datalen": datalen,
+        }
+        with open(meta_file, "w", encoding="utf-8") as f:
+            _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
+
+        return {
+            "code": code,
+            "rows": len(df),
+            "date_range": meta["date_range"],
+            "status": "ok",
+            "error": None,
+        }
+
+    except Exception as e:
+        return {"code": code, "rows": 0, "date_range": [], "status": "error",
+                "error": str(e)}
+
+
+def get_cached_stocks() -> list[dict]:
+    """列出所有已缓存的股票及其元信息。
+
+    Returns:
+        [{"code": "300750", "rows": 3200, "date_range": [...], "last_sync": "..."}, ...]
+    """
+    cache_dir = _cache_dir()
+    import json as _json_mod
+
+    results = []
+    if not os.path.exists(cache_dir):
+        return results
+
+    for meta_file in sorted(os.listdir(cache_dir)):
+        if not meta_file.endswith("-astock-daily-meta.json"):
+            continue
+        meta_path = os.path.join(cache_dir, meta_file)
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = _json_mod.load(f)
+            results.append(meta)
+        except Exception:
+            # Fallback: infer from CSV
+            code = meta_file.replace("-astock-daily-meta.json", "")
+            csv_path = os.path.join(cache_dir, f"{code}-astock-daily.csv")
+            if os.path.exists(csv_path):
+                try:
+                    df = pd.read_csv(csv_path, encoding="utf-8", on_bad_lines="skip")
+                    mtime = os.path.getmtime(csv_path)
+                    results.append({
+                        "code": code,
+                        "rows": len(df),
+                        "date_range": [df.iloc[0]["Date"], df.iloc[-1]["Date"]] if len(df) > 0 else [],
+                        "last_sync": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                        "source": "unknown",
+                    })
+                except Exception:
+                    pass
+
+    return results
+
+
+def delete_cache(code: str) -> bool:
+    """删除指定股票的缓存数据。
+
+    Returns:
+        True if any file was deleted, False otherwise.
+    """
+    deleted = False
+    for path in [_daily_cache_path(code), _daily_meta_path(code)]:
+        if os.path.exists(path):
+            os.remove(path)
+            deleted = True
+    return deleted
+
 
 def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV via mootdx, cache to CSV, filter by curr_date.
@@ -331,17 +535,17 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
     )
     os.makedirs(cache_dir, exist_ok=True)
 
-    cache_file = os.path.join(cache_dir, f"{code}-astock-daily.csv")
+    cache_file = _daily_cache_path(code)
 
     if os.path.exists(cache_file):
-        mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
-        if mtime.date() == datetime.now().date():
-            data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
-            data["Date"] = pd.to_datetime(data["Date"])
-            cutoff = pd.to_datetime(curr_date)
-            return data[data["Date"] <= cutoff]
+        # If cached file exists, use it (may have more data from sync_stock_data)
+        # Use cached data if it exists at all — sync_stock_data provides full history
+        data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
+        data["Date"] = pd.to_datetime(data["Date"])
+        cutoff = pd.to_datetime(curr_date)
+        return data[data["Date"] <= cutoff]
 
-    # Fetch from mootdx — 800 daily bars (~3 years of trading days)
+    # No cache or stale — fetch from mootdx (800 bars) then fallback to sina
     try:
         client = _get_mootdx_client()
         df = client.bars(symbol=code, category=4, offset=800)
@@ -1991,4 +2195,54 @@ def get_industry_comparison(
     except Exception as e:
         lines.append(f"行业对比查询失败: {e}")
 
-    return "\n".join(lines)
+
+# ===========================================================================
+# 10 缠论分析
+# ===========================================================================
+
+
+def get_chanlun_analysis(
+    symbol: Annotated[str, "6-digit A-stock code"],
+    curr_date: Annotated[str, "Current trading date, YYYY-mm-dd"],
+    look_back_days: Annotated[int, "Days of daily data to look back"] = 2000,
+) -> str:
+    """缠论综合分析 — 返回中枢、走势类型、背驰、买卖点的完整文本报告。
+
+    基于「缠中说禅」理论，对A股标的进行日线级别缠论分析。
+    分析内容：K线包含处理→分型识别→笔划分→线段→中枢→走势类型→背驰→买卖点。
+
+    需要本地缓存中有足够的日线数据（使用数据同步功能可获取）。
+    """
+    from .chanlun import analyze, format_result
+
+    code = _normalize_ticker(symbol)
+
+    # 尝试从本地缓存加载
+    cache_file = _daily_cache_path(code)
+
+    if os.path.exists(cache_file):
+        df = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
+        df["Date"] = pd.to_datetime(df["Date"])
+        cutoff = pd.to_datetime(curr_date)
+        df = df[df["Date"] <= cutoff]
+    else:
+        # 没有缓存，尝试在线获取
+        try:
+            df = _load_ohlcv_astock(symbol, curr_date)
+        except Exception as e:
+            return f"缠论分析失败：无法获取 {symbol} 的K线数据（{e}）。请先在「数据同步」页面同步该股票数据。"
+
+    if df.empty:
+        return f"缠论分析失败：{symbol} 无可用的K线数据。请先在「数据同步」页面同步该股票数据。"
+
+    # 截取最近 look_back_days 天数据
+    if len(df) > look_back_days:
+        df = df.iloc[-look_back_days:]
+
+    # 运行缠论分析
+    try:
+        result = analyze(df, symbol=code, curr_date=curr_date, level="daily")
+        return format_result(result)
+    except Exception as e:
+        logger.error("缠论分析异常 %s: %s", code, e)
+        return f"缠论分析异常：{e}"

@@ -42,6 +42,7 @@ from .a_stock import (
     get_dragon_tiger_board as get_astock_dragon_tiger_board,
     get_lockup_expiry as get_astock_lockup_expiry,
     get_industry_comparison as get_astock_industry_comparison,
+    get_chanlun_analysis as get_astock_chanlun_analysis,
 )
 
 # Configuration and routing logic
@@ -89,6 +90,12 @@ TOOLS_CATEGORIES = {
             "get_dragon_tiger_board",
             "get_lockup_expiry",
             "get_industry_comparison",
+        ]
+    },
+    "chanlun_analysis": {
+        "description": "缠论(缠中说禅)技术分析: 中枢/走势类型/背驰/买卖点",
+        "tools": [
+            "get_chanlun_analysis"
         ]
     }
 }
@@ -174,6 +181,9 @@ VENDOR_METHODS = {
     },
     "get_industry_comparison": {
         "a_stock": get_astock_industry_comparison,
+    },
+    "get_chanlun_analysis": {
+        "a_stock": get_astock_chanlun_analysis,
     },
 }
 
