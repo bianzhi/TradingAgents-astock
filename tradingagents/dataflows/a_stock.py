@@ -263,29 +263,117 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Sina K-line fallback helper (direct HTTP, no akshare)
+# Multi-source K-line fetching (东方财富 / 新浪 / 腾讯 / Tushare)
 # ---------------------------------------------------------------------------
 
+# Scale mapping: level → API parameter
+_KLINE_SCALE = {
+    "1min": "1", "5min": "5", "15min": "15", "30min": "30", "60min": "60",
+    "daily": "240", "weekly": "1200", "monthly": "5200",
+}
 
-def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """Fetch daily K-line from Sina HTTP API as mootdx fallback.
+# Eastmoney klt mapping (分钟级编码)
+_EASTMONEY_KLT = {
+    "1min": 1, "5min": 5, "15min": 15, "30min": 30, "60min": 60,
+    "daily": 101, "weekly": 102, "monthly": 103,
+}
 
-    Returns DataFrame with columns: Date, Open, High, Low, Close, Volume.
+# Fallback order by level
+_KLINE_FALLBACK_MINUTE = ["eastmoney", "sina", "tencent", "tushare"]
+_KLINE_FALLBACK_DAILY = ["sina", "tencent", "tushare", "eastmoney"]
+
+
+def _eastmoney_kline(code: str, level: str = "daily",
+                     start_date: str = None, datalen: int = 10000) -> pd.DataFrame:
+    """从东方财富获取K线数据（支持1分~日线）。
+
+    东方财富 push2his K线接口，日线最多10000根，分钟级最优。
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
+    """
+    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+    klt = _EASTMONEY_KLT.get(level, 101)
+
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "klt": str(klt),
+        "fqt": "1",  # 前复权
+        "lmt": str(datalen),
+        "end": "20500101",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+    }
+
+    try:
+        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        # SSL errors common in some environments — try without verify
+        try:
+            r = _requests.get(url, params=params, headers={"User-Agent": _UA},
+                              timeout=30, verify=False)
+            r.raise_for_status()
+        except Exception:
+            logger.warning("Eastmoney kline failed for %s/%s: %s", code, level, e)
+            return pd.DataFrame()
+    d = r.json()
+
+    klines = d.get("data", {}).get("klines", [])
+    if not klines:
+        return pd.DataFrame()
+
+    rows = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        rows.append({
+            "Date": parts[0],
+            "Open": float(parts[1]),
+            "Close": float(parts[2]),
+            "High": float(parts[3]),
+            "Low": float(parts[4]),
+            "Volume": int(float(parts[5])),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    if start_date:
+        df = df[df["Date"] >= pd.to_datetime(start_date)]
+
+    return df
+
+
+def _sina_kline(code: str, level: str = "daily",
+                start_date: str = None, datalen: int = 2000) -> pd.DataFrame:
+    """从新浪财经获取K线数据（1分~日线，速度快）。
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
     """
     prefix = "sh" if code.startswith("6") else "sz"
+    scale = _KLINE_SCALE.get(level, "240")
     url = (
         "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
         "CN_MarketData.getKLineData"
     )
     params = {
         "symbol": f"{prefix}{code}",
-        "scale": "240",  # daily
+        "scale": scale,
         "ma": "no",
-        "datalen": "800",
+        "datalen": str(datalen),
     }
-    r = _requests.get(url, params=params, timeout=15)
+    r = _requests.get(url, params=params, timeout=30)
     r.raise_for_status()
-    data = _json.loads(r.text)
+    try:
+        data = _json.loads(r.text)
+    except (ValueError, _json.JSONDecodeError):
+        return pd.DataFrame()
 
     if not data:
         return pd.DataFrame()
@@ -302,13 +390,293 @@ def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None
         })
 
     df = pd.DataFrame(rows)
+    if df.empty:
+        return df
     df["Date"] = pd.to_datetime(df["Date"])
 
     if start_date:
         df = df[df["Date"] >= pd.to_datetime(start_date)]
-    if end_date:
-        df = df[df["Date"] <= pd.to_datetime(end_date)]
 
+    return df
+
+
+def _tencent_kline(code: str, level: str = "daily",
+                   start_date: str = None, datalen: int = 2000) -> pd.DataFrame:
+    """从腾讯财经获取K线数据（1分~周线，稳定）。
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
+    """
+    prefix = "sh" if code.startswith("6") else "sz"
+    # 腾讯 K线 type: 1=1分, 5=5分, 15=15分, 30=30分, 60=60分, day=日线, week=周线
+    _TENCENT_TYPE = {
+        "1min": "1", "5min": "5", "15min": "15", "30min": "30", "60min": "60",
+        "daily": "day", "weekly": "week",
+    }
+    ktype = _TENCENT_TYPE.get(level, "day")
+
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    params = {
+        "_var": f"kline_{ktype}",
+        "param": f"{prefix}{code},{ktype},,{datalen},1,qfq",
+    }
+
+    try:
+        r = _requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        # SSL errors — retry without verify
+        try:
+            r = _requests.get(url, params=params, timeout=30, verify=False)
+            r.raise_for_status()
+        except Exception:
+            logger.warning("Tencent kline failed for %s/%s: %s", code, level, e)
+            return pd.DataFrame()
+
+    # 腾讯返回 js 变量赋值格式: kline_day="..."
+    text = r.text.strip()
+    eq_pos = text.find("=")
+    if eq_pos < 0:
+        return pd.DataFrame()
+    json_str = text[eq_pos + 1:].strip().rstrip(";")
+    try:
+        d = _json.loads(json_str)
+    except (ValueError, _json.JSONDecodeError):
+        return pd.DataFrame()
+
+    # 提取数据: d["data"][prefix+code]["qfqday"] 或 ["qfqweek"]
+    raw_data = d.get("data", {})
+    if isinstance(raw_data, list):
+        # Some responses return data as list — not usable
+        return pd.DataFrame()
+
+    stock_data = raw_data.get(prefix + code, {})
+    # 前复权数据优先
+    klines = stock_data.get(f"qfq{ktype}", stock_data.get(ktype, []))
+
+    if not klines:
+        return pd.DataFrame()
+
+    rows = []
+    for item in klines:
+        rows.append({
+            "Date": item[0],
+            "Open": float(item[1]),
+            "Close": float(item[2]),
+            "High": float(item[3]),
+            "Low": float(item[4]),
+            "Volume": int(float(item[5])) if len(item) > 5 else 0,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    if start_date:
+        df = df[df["Date"] >= pd.to_datetime(start_date)]
+
+    return df
+
+
+def _tushare_kline(code: str, level: str = "daily",
+                   start_date: str = None, datalen: int = 10000) -> pd.DataFrame:
+    """从 Tushare 获取K线数据（1分~月线，数据质量最高，需 token）。
+
+    需要 TUSHARE_TOKEN 环境变量。如未设置则跳过。
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
+        Empty DataFrame if token not configured or Tushare not installed.
+    """
+    token = os.environ.get("TUSHARE_TOKEN", "")
+    if not token:
+        return pd.DataFrame()
+
+    try:
+        import tushare as ts
+    except ImportError:
+        logger.info("tushare not installed, skipping Tushare data source")
+        return pd.DataFrame()
+
+    ts.set_token(token)
+    pro = ts.pro_api()
+
+    _TS_FREQ = {
+        "1min": "1min", "5min": "5min", "15min": "15min",
+        "30min": "30min", "60min": "60min",
+        "daily": "daily", "weekly": "weekly", "monthly": "monthly",
+    }
+    freq = _TS_FREQ.get(level, "daily")
+
+    # Tushare 需要 SH/SZ 前缀
+    ts_code = f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+
+    # start_date for tushare format
+    ts_start = None
+    if start_date:
+        ts_start = start_date.replace("-", "")
+
+    try:
+        if freq in ("1min", "5min", "15min", "30min", "60min"):
+            df = pro.stk_mins(
+                ts_code=ts_code, freq=freq, start_date=ts_start, limit=datalen
+            )
+        else:
+            df = pro.daily(
+                ts_code=ts_code, start_date=ts_start, limit=datalen
+            ) if freq == "daily" else pro.weekly(
+                ts_code=ts_code, start_date=ts_start, limit=datalen
+            ) if freq == "weekly" else pro.monthly(
+                ts_code=ts_code, start_date=ts_start, limit=datalen
+            )
+    except Exception as e:
+        logger.warning("Tushare fetch failed for %s: %s", code, e)
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Tushare columns: trade_date, open, high, low, close, vol
+    rename_map = {
+        "trade_date": "Date",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "vol": "Volume",
+    }
+    df = df.rename(columns=rename_map)
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    if start_date:
+        df = df[df["Date"] >= pd.to_datetime(start_date)]
+
+    return df
+
+
+def _fetch_kline(code: str, level: str = "daily",
+                 start_date: str = None, datalen: int = 10000,
+                 sources: list[str] | None = None) -> tuple[pd.DataFrame, str]:
+    """多数据源K线获取，主源失败自动切换备源。
+
+    Args:
+        code: 6位股票代码
+        level: K线级别 (1min/5min/15min/30min/60min/daily/weekly/monthly)
+        start_date: 起始日期 (YYYY-MM-DD)，默认从配置中读取
+        datalen: 最大K线数量
+        sources: 指定数据源顺序，None则按级别自动选择
+
+    Returns:
+        (DataFrame, source_name) 元组。DataFrame 列: Date,Open,High,Low,Close,Volume
+    """
+    if not start_date:
+        from .config import get_config
+        config = get_config()
+        start_date = config.get("kline_start_date", "2024-01-01")
+
+    if sources is None:
+        if level in ("1min", "5min", "15min", "30min", "60min"):
+            sources = _KLINE_FALLBACK_MINUTE
+        else:
+            sources = _KLINE_FALLBACK_DAILY
+
+    source_funcs = {
+        "eastmoney": _eastmoney_kline,
+        "sina": _sina_kline,
+        "tencent": _tencent_kline,
+        "tushare": _tushare_kline,
+    }
+
+    errors: list[str] = []
+    for src in sources:
+        func = source_funcs.get(src)
+        if func is None:
+            continue
+        try:
+            df = func(code, level=level, start_date=start_date, datalen=datalen)
+            if df is not None and not df.empty:
+                # 周线/月线：如果不是直接获取的级别，尝试从日线重采样
+                return df, src
+        except Exception as e:
+            errors.append(f"{src}: {e}")
+            logger.warning("K-line source %s failed for %s/%s: %s", src, code, level, e)
+            continue
+
+    # 所有源都失败了 — 日线 fallback from mootdx (TCP)
+    if level in ("daily", "weekly", "monthly"):
+        try:
+            client = _get_mootdx_client()
+            cat_map = {"daily": 4, "weekly": 5, "monthly": 6}
+            raw = client.bars(symbol=code, category=cat_map.get(level, 4), offset=800)
+            if raw is not None and not raw.empty:
+                raw = raw.drop(
+                    columns=["datetime", "year", "month", "day", "hour", "minute"],
+                    errors="ignore",
+                )
+                raw = raw.reset_index()
+                raw = raw.rename(columns={
+                    "datetime": "Date", "open": "Open", "close": "Close",
+                    "high": "High", "low": "Low", "volume": "Volume",
+                })
+                df = raw[["Date", "Open", "High", "Low", "Close", "Volume"]]
+                df["Date"] = pd.to_datetime(df["Date"])
+                if start_date:
+                    df = df[df["Date"] >= pd.to_datetime(start_date)]
+                if not df.empty:
+                    return df, "mootdx"
+        except Exception as e:
+            errors.append(f"mootdx: {e}")
+
+    logger.error("All K-line sources failed for %s/%s: %s", code, level, errors)
+    return pd.DataFrame(), "none"
+
+
+def _resample_kline(df: pd.DataFrame, target_level: str) -> pd.DataFrame:
+    """将日线K线重采样为周线/月线。
+
+    Args:
+        df: 日线 DataFrame，需包含 Date/Open/High/Low/Close/Volume 列
+        target_level: "weekly" 或 "monthly"
+
+    Returns:
+        重采样后的 DataFrame
+    """
+    if df.empty or target_level not in ("weekly", "monthly"):
+        return df
+
+    df = df.copy()
+    df = df.set_index("Date")
+
+    rule = "W-MON" if target_level == "weekly" else "ME"
+    agg = {
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }
+    resampled = df.resample(rule).agg(agg).dropna()
+    resampled = resampled.reset_index()
+
+    return resampled
+
+
+# ---------------------------------------------------------------------------
+# Legacy helpers (kept for backward compat)
+# ---------------------------------------------------------------------------
+
+
+def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+    """Fetch daily K-line from Sina HTTP API as mootdx fallback.
+
+    Returns DataFrame with columns: Date, Open, High, Low, Close, Volume.
+    """
+    df = _sina_kline(code, level="daily", start_date=start_date, datalen=800)
+    if end_date and not df.empty:
+        df = df[df["Date"] <= pd.to_datetime(end_date)]
     return df
 
 
@@ -323,38 +691,7 @@ def _sina_kline_full(code: str, datalen: int = 5000) -> pd.DataFrame:
     Returns:
         DataFrame with columns: Date, Open, High, Low, Close, Volume.
     """
-    prefix = "sh" if code.startswith("6") else "sz"
-    url = (
-        "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-        "CN_MarketData.getKLineData"
-    )
-    params = {
-        "symbol": f"{prefix}{code}",
-        "scale": "240",  # daily
-        "ma": "no",
-        "datalen": str(datalen),
-    }
-    r = _requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = _json.loads(r.text)
-
-    if not data:
-        return pd.DataFrame()
-
-    rows = []
-    for item in data:
-        rows.append({
-            "Date": item["day"],
-            "Open": float(item["open"]),
-            "High": float(item["high"]),
-            "Low": float(item["low"]),
-            "Close": float(item["close"]),
-            "Volume": int(item["volume"]),
-        })
-
-    df = pd.DataFrame(rows)
-    df["Date"] = pd.to_datetime(df["Date"])
-    return df
+    return _sina_kline(code, level="daily", start_date=None, datalen=datalen)
 
 
 # ---------------------------------------------------------------------------
@@ -372,103 +709,144 @@ def _cache_dir() -> str:
     return cache_dir
 
 
-def _daily_cache_path(code: str) -> str:
-    """Return the daily K-line CSV path for a stock code."""
-    return os.path.join(_cache_dir(), f"{code}-astock-daily.csv")
+def _daily_cache_path(code: str, level: str = "daily") -> str:
+    """Return the K-line CSV path for a stock code and level."""
+    return os.path.join(_cache_dir(), f"{code}-astock-{level}.csv")
 
 
-def _daily_meta_path(code: str) -> str:
-    """Return the daily K-line metadata JSON path."""
-    return os.path.join(_cache_dir(), f"{code}-astock-daily-meta.json")
+def _daily_meta_path(code: str, level: str = "daily") -> str:
+    """Return the K-line metadata JSON path."""
+    return os.path.join(_cache_dir(), f"{code}-astock-{level}-meta.json")
 
 
-def sync_stock_data(code: str, datalen: int = 5000) -> dict:
-    """全量同步单只股票的日线数据到本地缓存。
+def sync_stock_data(code: str, level: str = "daily",
+                    datalen: int = 10000, start_date: str = None,
+                    sources: list[str] | None = None) -> dict:
+    """全量同步单只股票的K线数据到本地缓存。四大数据源自动协同，主源失败自动切换备源。
 
-    使用新浪HTTP API获取历史数据（支持最多5000根K线），
-    存储到CSV文件 + 元信息JSON。
+    数据源与级别支持:
+        - 东方财富 (1分~日线, 日线最多10000根, 分钟级最优)
+        - 新浪财经 (1分~日线, 速度快, 最多2000根)
+        - 腾讯财经 (1分~周线, 稳定, 最多2000根)
+        - Tushare  (1分~月线, 数据质量最高, 需 token)
+
+    同步策略:
+        - 分钟级: 东方财富 → 新浪 → 腾讯 → Tushare
+        - 日线/周线/月线: 新浪 → 腾讯 → Tushare → 东方财富
+        - 周线/月线: 优先直接获取，失败则从日线重采样确保完整性
+        - 全部失败: mootdx TCP 兜底 (最多800根)
 
     Args:
         code: 6位股票代码
-        datalen: 拉取的K线数量，默认5000
+        level: K线级别 (1min/5min/15min/30min/60min/daily/weekly/monthly)
+        datalen: 拉取的最大K线数量，默认10000
+        start_date: 起始日期 (YYYY-MM-DD)，None则从配置读取 (默认20240101)
+        sources: 指定数据源顺序，None则按级别自动选择
 
     Returns:
         同步结果 dict:
         {
             "code": "300750",
+            "level": "daily",
             "rows": 3200,
             "date_range": ["2008-06-12", "2025-06-15"],
+            "source": "sina",
             "status": "ok" | "error",
             "error": None | "error message"
         }
     """
     code = _normalize_ticker(code)
-    cache_file = _daily_cache_path(code)
-    meta_file = _daily_meta_path(code)
+    cache_file = _daily_cache_path(code, level)
+    meta_file = _daily_meta_path(code, level)
 
-    try:
-        df = _sina_kline_full(code, datalen=datalen)
-        if df.empty:
-            # Try mootdx fallback
-            try:
-                client = _get_mootdx_client()
-                raw = client.bars(symbol=code, category=4, offset=800)
-                if raw is not None and not raw.empty:
-                    raw = raw.drop(
-                        columns=["datetime", "year", "month", "day", "hour", "minute"],
-                        errors="ignore",
-                    )
-                    raw = raw.reset_index()
-                    raw = raw.rename(columns={
-                        "datetime": "Date", "open": "Open", "close": "Close",
-                        "high": "High", "low": "Low", "volume": "Volume",
-                    })
-                    df = raw[["Date", "Open", "High", "Low", "Close", "Volume"]]
-                    df["Date"] = pd.to_datetime(df["Date"])
-            except Exception:
-                pass
+    # Resolve start_date
+    if not start_date:
+        from .config import get_config
+        config = get_config()
+        start_date = config.get("kline_start_date", "2024-01-01")
 
-        if df.empty:
-            return {"code": code, "rows": 0, "date_range": [], "status": "error",
-                    "error": "无法从新浪/mootdx获取数据"}
+    # Get K-line data using multi-source fetcher
+    df, source_name = _fetch_kline(
+        code, level=level, start_date=start_date,
+        datalen=datalen, sources=sources,
+    )
 
-        # Save CSV
-        df.to_csv(cache_file, index=False, encoding="utf-8")
+    # 周线/月线：尝试直接获取失败后，从日线重采样
+    if df.empty and level in ("weekly", "monthly"):
+        logger.info("Direct %s fetch failed for %s, trying daily resample", level, code)
+        df_daily, daily_src = _fetch_kline(
+            code, level="daily", start_date=start_date,
+            datalen=datalen, sources=sources,
+        )
+        if not df_daily.empty:
+            df = _resample_kline(df_daily, level)
+            source_name = f"{daily_src}(resample→{level})"
 
-        # Save meta
-        import json as _json_mod
-        meta = {
-            "code": code,
-            "rows": len(df),
-            "date_range": [
-                df["Date"].min().strftime("%Y-%m-%d"),
-                df["Date"].max().strftime("%Y-%m-%d"),
-            ],
-            "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source": "sina",
-            "datalen": datalen,
-        }
-        with open(meta_file, "w", encoding="utf-8") as f:
-            _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
+    # mootdx TCP fallback for daily
+    if df.empty and level == "daily":
+        try:
+            client = _get_mootdx_client()
+            raw = client.bars(symbol=code, category=4, offset=800)
+            if raw is not None and not raw.empty:
+                raw = raw.drop(
+                    columns=["datetime", "year", "month", "day", "hour", "minute"],
+                    errors="ignore",
+                )
+                raw = raw.reset_index()
+                raw = raw.rename(columns={
+                    "datetime": "Date", "open": "Open", "close": "Close",
+                    "high": "High", "low": "Low", "volume": "Volume",
+                })
+                df = raw[["Date", "Open", "High", "Low", "Close", "Volume"]]
+                df["Date"] = pd.to_datetime(df["Date"])
+                source_name = "mootdx"
+        except Exception:
+            pass
 
+    if df.empty:
         return {
-            "code": code,
-            "rows": len(df),
-            "date_range": meta["date_range"],
-            "status": "ok",
-            "error": None,
+            "code": code, "level": level, "rows": 0,
+            "date_range": [], "source": "none",
+            "status": "error", "error": "所有数据源均无法获取数据",
         }
 
-    except Exception as e:
-        return {"code": code, "rows": 0, "date_range": [], "status": "error",
-                "error": str(e)}
+    # Save CSV
+    df.to_csv(cache_file, index=False, encoding="utf-8")
+
+    # Save meta
+    import json as _json_mod
+    meta = {
+        "code": code,
+        "level": level,
+        "rows": len(df),
+        "date_range": [
+            df["Date"].min().strftime("%Y-%m-%d"),
+            df["Date"].max().strftime("%Y-%m-%d"),
+        ],
+        "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source_name,
+        "datalen": datalen,
+        "start_date": start_date,
+    }
+    with open(meta_file, "w", encoding="utf-8") as f:
+        _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return {
+        "code": code,
+        "level": level,
+        "rows": len(df),
+        "date_range": meta["date_range"],
+        "source": source_name,
+        "status": "ok",
+        "error": None,
+    }
 
 
 def get_cached_stocks() -> list[dict]:
     """列出所有已缓存的股票及其元信息。
 
     Returns:
-        [{"code": "300750", "rows": 3200, "date_range": [...], "last_sync": "..."}, ...]
+        [{"code": "300750", "level": "daily", "rows": 3200, ...}, ...]
     """
     cache_dir = _cache_dir()
     import json as _json_mod
@@ -478,64 +856,84 @@ def get_cached_stocks() -> list[dict]:
         return results
 
     for meta_file in sorted(os.listdir(cache_dir)):
-        if not meta_file.endswith("-astock-daily-meta.json"):
+        if not meta_file.endswith("-meta.json") or "-astock-" not in meta_file:
             continue
         meta_path = os.path.join(cache_dir, meta_file)
+        # Infer level from filename: {code}-astock-{level}-meta.json
+        base = meta_file.replace("-meta.json", "")
+        parts = base.split("-astock-")
+        inferred_level = parts[1] if len(parts) == 2 else "daily"
+
         try:
             with open(meta_path, encoding="utf-8") as f:
                 meta = _json_mod.load(f)
+            # Backfill missing fields for old caches
+            if "level" not in meta:
+                meta["level"] = inferred_level
+            if "start_date" not in meta:
+                meta["start_date"] = ""
             results.append(meta)
         except Exception:
             # Fallback: infer from CSV
-            code = meta_file.replace("-astock-daily-meta.json", "")
-            csv_path = os.path.join(cache_dir, f"{code}-astock-daily.csv")
-            if os.path.exists(csv_path):
-                try:
-                    df = pd.read_csv(csv_path, encoding="utf-8", on_bad_lines="skip")
-                    mtime = os.path.getmtime(csv_path)
-                    results.append({
-                        "code": code,
-                        "rows": len(df),
-                        "date_range": [df.iloc[0]["Date"], df.iloc[-1]["Date"]] if len(df) > 0 else [],
-                        "last_sync": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                        "source": "unknown",
-                    })
-                except Exception:
-                    pass
+            if len(parts) == 2:
+                code, level = parts
+                csv_path = os.path.join(cache_dir, f"{code}-astock-{level}.csv")
+                if os.path.exists(csv_path):
+                    try:
+                        df = pd.read_csv(csv_path, encoding="utf-8", on_bad_lines="skip")
+                        mtime = os.path.getmtime(csv_path)
+                        results.append({
+                            "code": code,
+                            "level": level,
+                            "rows": len(df),
+                            "date_range": [df.iloc[0]["Date"], df.iloc[-1]["Date"]] if len(df) > 0 else [],
+                            "last_sync": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                            "source": "unknown",
+                            "start_date": "",
+                        })
+                    except Exception:
+                        pass
 
     return results
 
 
-def delete_cache(code: str) -> bool:
+def delete_cache(code: str, level: str | None = None) -> bool:
     """删除指定股票的缓存数据。
+
+    Args:
+        code: 6位股票代码
+        level: K线级别，None则删除所有级别
 
     Returns:
         True if any file was deleted, False otherwise.
     """
     deleted = False
-    for path in [_daily_cache_path(code), _daily_meta_path(code)]:
-        if os.path.exists(path):
-            os.remove(path)
-            deleted = True
+    if level:
+        for path in [_daily_cache_path(code, level), _daily_meta_path(code, level)]:
+            if os.path.exists(path):
+                os.remove(path)
+                deleted = True
+    else:
+        # Delete all levels for this code
+        cache_dir = _cache_dir()
+        if os.path.exists(cache_dir):
+            for f in os.listdir(cache_dir):
+                if f.startswith(f"{code}-astock-") and (
+                    f.endswith(".csv") or f.endswith("-meta.json")
+                ):
+                    os.remove(os.path.join(cache_dir, f))
+                    deleted = True
     return deleted
 
 
 def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
-    """Fetch OHLCV via mootdx, cache to CSV, filter by curr_date.
+    """Fetch OHLCV daily data, using cached/sync data first, then multi-source fetch.
 
-    Mirrors stockstats_utils.load_ohlcv but uses mootdx instead of yfinance.
+    Mirrors stockstats_utils.load_ohlcv but uses A-stock data sources.
     Returns DataFrame with columns: Date, Open, High, Low, Close, Volume
     """
-    from .config import get_config
-
     code = _normalize_ticker(symbol)
-    config = get_config()
-    cache_dir = config.get(
-        "data_cache_dir", os.path.expanduser("~/.tradingagents/cache")
-    )
-    os.makedirs(cache_dir, exist_ok=True)
-
-    cache_file = _daily_cache_path(code)
+    cache_file = _daily_cache_path(code, "daily")
 
     if os.path.exists(cache_file):
         # If cached file exists, use it (may have more data from sync_stock_data)
@@ -545,40 +943,33 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
         cutoff = pd.to_datetime(curr_date)
         return data[data["Date"] <= cutoff]
 
-    # No cache or stale — fetch from mootdx (800 bars) then fallback to sina
-    try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
-
-        if df is None or df.empty:
-            raise ValueError(f"No OHLCV data from mootdx for {code}")
-
-        # mootdx returns index named 'datetime' AND a column named 'datetime'
-        # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
-        df = df.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
-        df = df.reset_index()  # moves index 'datetime' → column 'datetime'
-        rename_map = {
-            "datetime": "Date",
-            "open": "Open",
-            "close": "Close",
-            "high": "High",
-            "low": "Low",
-            "volume": "Volume",
-        }
-        df = df.rename(columns=rename_map)
-        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-        df["Date"] = pd.to_datetime(df["Date"])
-    except Exception as e:
-        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
+    # No cache — fetch from multi-source API (with mootdx final fallback)
+    df, _ = _fetch_kline(code, level="daily", start_date=None, datalen=10000)
+    if df.empty:
+        # Final mootdx TCP fallback
         try:
-            df = _sina_kline_fallback(code)
-            if df.empty:
-                raise ValueError(f"No OHLCV data from sina for {code}")
-        except Exception:
-            raise ValueError(f"No OHLCV data from mootdx/sina for {code}")
+            client = _get_mootdx_client()
+            raw = client.bars(symbol=code, category=4, offset=800)
+            if raw is not None and not raw.empty:
+                raw = raw.drop(
+                    columns=["datetime", "year", "month", "day", "hour", "minute"],
+                    errors="ignore",
+                )
+                raw = raw.reset_index()
+                raw = raw.rename(columns={
+                    "datetime": "Date", "open": "Open", "close": "Close",
+                    "high": "High", "low": "Low", "volume": "Volume",
+                })
+                df = raw[["Date", "Open", "High", "Low", "Close", "Volume"]]
+                df["Date"] = pd.to_datetime(df["Date"])
+        except Exception as e:
+            raise ValueError(f"No OHLCV data available for {code}: {e}")
+
+    if df.empty:
+        raise ValueError(f"No OHLCV data available for {code}")
 
     # Cache to disk
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
     df.to_csv(cache_file, index=False, encoding="utf-8")
 
     # Filter by curr_date to prevent look-ahead bias
@@ -599,57 +990,24 @@ def get_stock_data(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ) -> str:
-    """Get OHLCV stock price data via mootdx."""
+    """Get OHLCV stock price data via multi-source K-line fetcher."""
     code = _normalize_ticker(symbol)
 
-    data_source = "mootdx (TCP)"
-    try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
-
-        if df is None or df.empty:
-            raise ValueError(f"No data from mootdx for {code}")
-
-        # Drop duplicate datetime column + extra columns before reset_index
-        df = df.drop(
-            columns=["datetime", "year", "month", "day", "hour", "minute"],
-            errors="ignore",
-        )
-        df = df.reset_index()  # index 'datetime' → column 'datetime'
-        df = df.rename(
-            columns={
-                "datetime": "Date",
-                "open": "Open",
-                "close": "Close",
-                "high": "High",
-                "low": "Low",
-                "volume": "Volume",
-                "amount": "Amount",
-            }
-        )
-        df["Date"] = pd.to_datetime(df["Date"])
-
-    except Exception as e:
-        logger.warning("mootdx K-line failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
-        try:
-            df = _sina_kline_fallback(code, start_date, end_date)
-            if df.empty:
-                return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
-            data_source = "sina HTTP (fallback)"
-        except Exception:
-            return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
-
-    # Filter by date range
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
-    df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
+    # Use multi-source fetcher with date filter
+    df, data_source = _fetch_kline(
+        code, level="daily", start_date=start_date, datalen=10000,
+    )
 
     if df.empty:
         return (
             f"No data found for A-stock '{code}' "
-            f"between {start_date} and {end_date}"
+            f"between {start_date} and {end_date}. "
+            f"All data sources (eastmoney/sina/tencent/tushare/mootdx) failed."
         )
+
+    # Filter by end_date
+    end_dt = pd.to_datetime(end_date)
+    df = df[df["Date"] <= end_dt]
 
     for col in ["Open", "High", "Low", "Close"]:
         if col in df.columns:
@@ -2205,30 +2563,51 @@ def get_chanlun_analysis(
     symbol: Annotated[str, "6-digit A-stock code"],
     curr_date: Annotated[str, "Current trading date, YYYY-mm-dd"],
     look_back_days: Annotated[int, "Days of daily data to look back"] = 2000,
+    level: Annotated[str, "K-line level: daily/weekly/monthly"] = "daily",
+    start_date: Annotated[str, "Start date YYYY-MM-DD, empty=from config"] = "",
 ) -> str:
     """缠论综合分析 — 返回中枢、走势类型、背驰、买卖点的完整文本报告。
 
-    基于「缠中说禅」理论，对A股标的进行日线级别缠论分析。
+    基于「缠中说禅」理论，对A股标的进行缠论分析。
     分析内容：K线包含处理→分型识别→笔划分→线段→中枢→走势类型→背驰→买卖点。
 
-    需要本地缓存中有足够的日线数据（使用数据同步功能可获取）。
+    需要本地缓存中有足够的K线数据（使用数据同步功能可获取）。
     """
     from .chanlun import analyze, format_result
 
     code = _normalize_ticker(symbol)
 
+    # Resolve start_date
+    if not start_date:
+        from .config import get_config
+        config = get_config()
+        start_date = config.get("kline_start_date", "2024-01-01")
+
     # 尝试从本地缓存加载
-    cache_file = _daily_cache_path(code)
+    cache_file = _daily_cache_path(code, level)
 
     if os.path.exists(cache_file):
         df = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
         df["Date"] = pd.to_datetime(df["Date"])
         cutoff = pd.to_datetime(curr_date)
         df = df[df["Date"] <= cutoff]
+        if start_date:
+            df = df[df["Date"] >= pd.to_datetime(start_date)]
     else:
         # 没有缓存，尝试在线获取
         try:
-            df = _load_ohlcv_astock(symbol, curr_date)
+            df, _ = _fetch_kline(code, level=level, start_date=start_date, datalen=10000)
+            if not df.empty:
+                cutoff = pd.to_datetime(curr_date)
+                df = df[df["Date"] <= cutoff]
+            else:
+                # 对周线/月线尝试日线重采样
+                if level in ("weekly", "monthly"):
+                    df_daily, _ = _fetch_kline(code, level="daily", start_date=start_date, datalen=10000)
+                    if not df_daily.empty:
+                        cutoff = pd.to_datetime(curr_date)
+                        df_daily = df_daily[df_daily["Date"] <= cutoff]
+                        df = _resample_kline(df_daily, level)
         except Exception as e:
             return f"缠论分析失败：无法获取 {symbol} 的K线数据（{e}）。请先在「数据同步」页面同步该股票数据。"
 
@@ -2241,7 +2620,7 @@ def get_chanlun_analysis(
 
     # 运行缠论分析
     try:
-        result = analyze(df, symbol=code, curr_date=curr_date, level="daily")
+        result = analyze(df, symbol=code, curr_date=curr_date, level=level)
         return format_result(result)
     except Exception as e:
         logger.error("缠论分析异常 %s: %s", code, e)
