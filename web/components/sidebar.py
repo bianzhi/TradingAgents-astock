@@ -109,11 +109,38 @@ def render_sidebar() -> None:
     st.markdown("#### 新建分析")
 
     ticker = st.text_input(
-        "股票代码",
-        placeholder="例: 300750 或 宁德时代",
+        "股票搜索",
+        placeholder="输入代码、中文名或拼音首字母（如: 宁德、300750、ndsd）",
         key="input_ticker",
-        help="输入6位A股代码或中文股票全称",
+        help="支持6位代码、中文股票名、拼音首字母（如 ndsd=宁德时代, gzmt=贵州茅台）",
     )
+
+    # --- Live search dropdown ---
+    if ticker and ticker.strip():
+        from tradingagents.dataflows.a_stock import search_stocks
+
+        results = search_stocks(ticker.strip(), limit=10)
+        if len(results) == 1:
+            # Single exact match — show confirmation
+            r = results[0]
+            st.caption(f"🔍 {r['code']} {r['name']}")
+        elif len(results) > 1:
+            # Multiple matches — show as radio select
+            options = {f"{r['code']}  {r['name']}": r["code"] for r in results}
+            st.caption(f"🔍 找到 {len(results)} 个匹配，点击选择:")
+            selected = st.radio(
+                "匹配结果",
+                list(options.keys()),
+                label_visibility="collapsed",
+                key="search_result_radio",
+            )
+            if selected:
+                ticker = options[selected]
+                # Update the text input with the selected ticker
+                st.session_state["input_ticker"] = ticker
+                st.rerun()
+        elif len(ticker.strip()) >= 2:
+            st.caption("未找到匹配结果")
 
     trade_date = st.date_input(
         "分析日期",

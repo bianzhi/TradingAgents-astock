@@ -37,6 +37,7 @@ dependencies = [
     "fpdf2>=2.8.0",
     "python-dotenv>=1.1.0",
     "mootdx>=0.10.0",
+    "pypinyin>=0.53.0",
 ]
 
 [project.urls]

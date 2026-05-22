@@ -150,29 +150,40 @@ _code_to_name: dict[str, str] | None = None
 
 
 def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
-    """Build name→code and code→name maps via mootdx (both SH & SZ markets)."""
+    """Build name→code and code→name maps via mootdx (both SH & SZ markets).
+
+    Falls back to an empty map if mootdx is unreachable. The resolve_ticker
+    function will still work via EastMoney suggest API through search_stocks.
+    """
     global _name_to_code, _code_to_name
     if _name_to_code is not None:
         return _name_to_code, _code_to_name
 
-    from mootdx.quotes import Quotes
-
-    client = Quotes.factory(market="std")
     n2c: dict[str, str] = {}
     c2n: dict[str, str] = {}
 
-    for market in (0, 1):  # 0=SZ, 1=SH
-        stocks = client.stocks(market=market)
-        if stocks is None or stocks.empty:
-            continue
-        for _, row in stocks.iterrows():
-            code = str(row["code"]).strip()
-            name = str(row["name"]).strip()
-            if not _re.match(r"^[036]\d{5}$", code):
-                continue
-            clean_name = name.replace(" ", "").replace("　", "")
-            n2c[clean_name] = code
-            c2n[code] = clean_name
+    # Primary: mootdx (full market coverage)
+    try:
+        from mootdx.quotes import Quotes
+
+        client = Quotes.factory(market="std")
+        for market in (0, 1):  # 0=SZ, 1=SH
+            try:
+                stocks = client.stocks(market=market)
+                if stocks is None or stocks.empty:
+                    continue
+                for _, row in stocks.iterrows():
+                    code = str(row["code"]).strip()
+                    name = str(row["name"]).strip()
+                    if not _re.match(r"^[036]\d{5}$", code):
+                        continue
+                    clean_name = name.replace(" ", "").replace("　", "")
+                    n2c[clean_name] = code
+                    c2n[code] = clean_name
+            except Exception as e:
+                logger.warning("mootdx market=%d stocks failed: %s", market, e)
+    except Exception as e:
+        logger.warning("mootdx unavailable, name-code map will be empty: %s", e)
 
     _name_to_code = n2c
     _code_to_name = c2n
@@ -183,7 +194,7 @@ def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
 def resolve_ticker(user_input: str) -> str:
     """Resolve user input (code or Chinese name) to a 6-digit A-stock code.
 
-    Accepts: '600379', 'SH600379', '600379.SH', '宝光股份'
+    Accepts: '600379', 'SH600379', '600379.SH', '宝光股份', 'gzmt'
     Returns: '600379'
     Raises: ValueError if not resolvable.
     """
@@ -191,12 +202,19 @@ def resolve_ticker(user_input: str) -> str:
     if not s:
         raise ValueError("输入不能为空")
 
-    has_chinese = any("一" <= ch <= "鿿" for ch in s)
+    has_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in s)
 
+    # If purely alphanumeric (no Chinese), try as ticker code first
     if not has_chinese:
-        return _normalize_ticker(s)
+        try:
+            code = _normalize_ticker(s)
+            if _re.match(r"^[036]\d{5}$", code):
+                return code
+        except ValueError:
+            pass
+        # Not a valid 6-digit A-stock code — try search (pinyin, partial code, etc.)
 
-    clean = s.replace(" ", "").replace("　", "")
+    clean = s.replace(" ", "").replace("\u3000", "")
     n2c, _ = _build_name_code_map()
 
     if clean in n2c:
@@ -209,7 +227,158 @@ def resolve_ticker(user_input: str) -> str:
         examples = ", ".join(f"{n}({c})" for n, c in list(matches.items())[:5])
         raise ValueError(f"'{s}' 匹配到多只股票: {examples}，请输入完整名称或代码")
 
+    # Fallback: use EastMoney API if local map is empty / no match
+    results = search_stocks(clean, limit=1)
+    if results:
+        return results[0]["code"]
+
     raise ValueError(f"找不到股票 '{s}'，请检查名称是否正确")
+
+
+# ---------------------------------------------------------------------------
+# Stock search (code / Chinese name / pinyin)
+# ---------------------------------------------------------------------------
+
+def _eastmoney_suggest(query: str, count: int = 10) -> list[dict]:
+    """Search stocks via East Money suggest API (realtime, no local index needed).
+
+    Supports Chinese name, pinyin (full + initials), and code search.
+    Returns list of {"code": str, "name": str} filtered to A-share 6-digit codes.
+    """
+    url = "https://searchapi.eastmoney.com/api/suggest/get"
+    params = {
+        "input": query,
+        "type": "14",
+        "token": "D43BF722C8E33BDC906FB84D85E326E8",
+        "count": count * 2,  # over-fetch, filter later
+    }
+    try:
+        r = _requests.get(url, params=params, timeout=5)
+        data = r.json()
+        items = data.get("QuotationCodeTable", {}).get("Data") or []
+        results = []
+        seen = set()
+        for item in items:
+            code = str(item.get("Code", "")).strip()
+            name = str(item.get("Name", "")).strip()
+            # Only keep A-share 6-digit codes (0xxxxx, 3xxxxx, 6xxxxx)
+            if not _re.match(r"^[036]\d{5}$", code):
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            results.append({"code": code, "name": name})
+            if len(results) >= count:
+                break
+        return results
+    except Exception as e:
+        logger.debug("EastMoney suggest API failed: %s", e)
+        return []
+
+
+# Pinyin search index — used as fallback when EastMoney API is unavailable
+_pinyin_index: list[tuple[str, str, str, str]] | None = None
+# Each entry: (code, name, pinyin_full, pinyin_initials)
+
+
+def _build_pinyin_index() -> list[tuple[str, str, str, str]]:
+    """Build pinyin search index from the name-code map.
+
+    Returns a list of (code, name, pinyin_full, pinyin_initials) tuples.
+    Built once and cached globally.  Only used as fallback.
+    """
+    global _pinyin_index
+    if _pinyin_index is not None:
+        return _pinyin_index
+
+    from pypinyin import pinyin, Style
+
+    n2c, _ = _build_name_code_map()
+    if not n2c:
+        _pinyin_index = []
+        return _pinyin_index
+
+    index: list[tuple[str, str, str, str]] = []
+    for name, code in n2c.items():
+        py_full = "".join(p[0] for p in pinyin(name, style=Style.NORMAL))
+        py_init = "".join(p[0] for p in pinyin(name, style=Style.FIRST_LETTER))
+        index.append((code, name, py_full, py_init))
+
+    _pinyin_index = index
+    logger.info("Built pinyin search index: %d entries", len(index))
+    return _pinyin_index
+
+
+def search_stocks(query: str, limit: int = 10) -> list[dict]:
+    """Search A-share stocks by code, Chinese name, or pinyin.
+
+    Supports:
+    - 6-digit code (full or prefix): "600519", "600"
+    - Chinese name (full or substring): "贵州茅台", "茅台"
+    - Pinyin full (prefix): "guizhou" → 贵州茅台
+    - Pinyin initials (prefix): "gzmt" → 贵州茅台, "gzm" → 贵州茅台
+
+    Primary: EastMoney suggest API (realtime, no local index).
+    Fallback: mootdx local name-code map + pypinyin index.
+
+    Args:
+        query: Search keyword (code / Chinese / pinyin).
+        limit: Max number of results (default 10).
+
+    Returns:
+        List of {"code": str, "name": str} dicts, ranked by relevance.
+    """
+    q = query.strip()
+    if not q:
+        return []
+
+    # --- Primary: EastMoney suggest API ---
+    results = _eastmoney_suggest(q, count=limit)
+    if results:
+        return results
+
+    # --- Fallback: local pinyin index ---
+    logger.info("EastMoney suggest failed, falling back to local pinyin index")
+    n2c, c2n = _build_name_code_map()
+    if not n2c:
+        return []
+
+    index = _build_pinyin_index()
+    if not index:
+        return []
+
+    q_lower = q.lower()
+
+    # Score each candidate: higher = better match
+    scored: list[tuple[int, str, str]] = []
+
+    for code, name, py_full, py_init in index:
+        score = 0
+
+        if code == q:
+            score = 1000
+        elif code.startswith(q):
+            score = 800
+        elif name == q:
+            score = 900
+        elif q in name:
+            score = 600
+        elif py_full.startswith(q_lower):
+            score = 400
+        elif q_lower in py_full:
+            score = 200
+        elif py_init == q_lower:
+            score = 500
+        elif py_init.startswith(q_lower):
+            score = 300
+        elif q.isdigit() and len(q) >= 2 and q in code:
+            score = 100
+
+        if score > 0:
+            scored.append((score, code, name))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [{"code": code, "name": name} for _, code, name in scored[:limit]]
 
 
 # ---------------------------------------------------------------------------
