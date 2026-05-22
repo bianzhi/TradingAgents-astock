@@ -888,6 +888,68 @@ def _resample_minute_kline(df_5min: pd.DataFrame,
 
 
 
+def _eastmoney_trends2(code: str, level: str = "30min",
+                       ndays: int = 5) -> pd.DataFrame:
+    """从东财 trends2 API 获取分时走势数据并聚合为分钟K线。
+
+    push2his/push2 K线接口被代理阻断时，trends2 是可靠备选。
+    trends2 返回最近 ndays 天的1分钟分时数据。
+
+    Args:
+        code: 6位股票代码
+        level: 目标K线级别 (5min/15min/30min/60min)
+        ndays: 获取最近多少天的分时数据 (最多5天有效)
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume
+    """
+    secid = _eastmoney_secid(code)
+    url = "http://push2his.eastmoney.com/api/qt/stock/trends2/get"
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        "secid": secid,
+        "ndays": str(min(ndays, 5)),
+    }
+    try:
+        r = _requests.get(url, params=params, headers={"User-Agent": _UA},
+                          timeout=15, proxies=_NO_PROXY)
+        data = r.json()
+    except Exception as e:
+        logger.warning("trends2 failed for %s: %s", code, e)
+        return pd.DataFrame()
+
+    trends = (data or {}).get("data", {}).get("trends", [])
+    if not trends:
+        return pd.DataFrame()
+
+    # trends 格式: "2025-04-18 09:30,0.37,0.37,0.37,0.37,30729,1136973.00"
+    rows = []
+    for t in trends:
+        parts = t.split(",")
+        if len(parts) < 7:
+            continue
+        try:
+            rows.append({
+                "Date": pd.to_datetime(parts[0]),
+                "Open": float(parts[1]),
+                "Close": float(parts[2]),
+                "High": float(parts[3]),
+                "Low": float(parts[4]),
+                "Volume": int(float(parts[5])),
+            })
+        except (ValueError, IndexError):
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df_1min = pd.DataFrame(rows)
+    # 聚合为目标级别
+    df_resampled = _resample_minute_kline(df_1min, level)
+    return df_resampled
+
+
 def _fetch_kline(code: str, level: str = "daily",
                  start_date: str = None, datalen: int = 10000,
                  sources: list[str] | None = None) -> tuple[pd.DataFrame, str]:
@@ -938,8 +1000,9 @@ def _fetch_kline(code: str, level: str = "daily",
             _time.sleep(_KLINE_REQUEST_INTERVAL)
             continue
 
-    # 分钟级K线: 尝试从同花顺5分钟K线聚合（东财/新浪/腾讯均失败时）
+    # 分钟级K线: 依次尝试同花顺5分钟聚合 → 东财 trends2 (最近5天分时, 最后兜底)
     if level in ("5min", "15min", "30min", "60min"):
+        # 1) 同花顺5分钟K线聚合（历史数据丰富）
         try:
             df_5min = _ths_kline_5min(code, start_date=start_date, datalen=datalen * 6)
             if df_5min is not None and not df_5min.empty:
@@ -950,6 +1013,14 @@ def _fetch_kline(code: str, level: str = "daily",
                     return df_resampled, f"ths5min(→{level})"
         except Exception as e:
             errors.append(f"ths5min: {e}")
+
+        # 2) 东财 trends2: 从分时走势获取近5天分钟数据并聚合（兜底，仅近期数据）
+        try:
+            df_t2 = _eastmoney_trends2(code, level=level, ndays=5)
+            if df_t2 is not None and not df_t2.empty:
+                return df_t2, f"trends2(→{level})"
+        except Exception as e:
+            errors.append(f"trends2: {e}")
 
     # 所有源都失败了 — 日线 fallback from mootdx (TCP)
     if level in ("daily", "weekly", "monthly"):
