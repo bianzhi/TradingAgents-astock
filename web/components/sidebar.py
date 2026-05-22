@@ -42,8 +42,26 @@ def _resolve_user_input(raw: str) -> tuple[str, str | None]:
 
 
 def _render_llm_config() -> None:
-    """Render LLM provider and model selection controls."""
+    """Render LLM provider and model selection controls.
 
+    Model choices are persisted to URL query params so they survive
+    browser refresh (F5 / Cmd+R).
+    """
+
+    # --- On first load after browser refresh, restore from URL query params ---
+    if "llm_provider" not in st.session_state:
+        params = st.query_params
+        provider = params.get("provider")
+        if provider and provider in _PROVIDER_KEYS:
+            st.session_state["llm_provider_idx"] = _PROVIDER_KEYS.index(provider)
+        quick = params.get("quick_model")
+        if quick:
+            st.session_state["_restore_quick"] = quick
+        deep = params.get("deep_model")
+        if deep:
+            st.session_state["_restore_deep"] = deep
+
+    # --- Provider ---
     provider_idx = st.selectbox(
         "LLM 供应商",
         range(len(_PROVIDERS)),
@@ -54,6 +72,9 @@ def _render_llm_config() -> None:
     provider_key = _PROVIDER_KEYS[provider_idx]
     st.session_state["llm_provider"] = provider_key
 
+    quick_val = ""
+    deep_val = ""
+
     if provider_key in MODEL_OPTIONS:
         quick_options = MODEL_OPTIONS[provider_key]["quick"]
         deep_options = MODEL_OPTIONS[provider_key]["deep"]
@@ -63,6 +84,11 @@ def _render_llm_config() -> None:
         deep_labels = [label for label, _ in deep_options]
         deep_values = [value for _, value in deep_options]
 
+        # --- Quick model ---
+        restore_quick = st.session_state.pop("_restore_quick", None)
+        if restore_quick and restore_quick in quick_values:
+            st.session_state["quick_model_idx"] = quick_values.index(restore_quick)
+
         quick_idx = st.selectbox(
             "快速思考模型",
             range(len(quick_options)),
@@ -70,7 +96,12 @@ def _render_llm_config() -> None:
             key="quick_model_idx",
             help="用于常规分析任务，速度优先",
         )
-        st.session_state["quick_think_llm"] = quick_values[quick_idx]
+        quick_val = quick_values[quick_idx]
+
+        # --- Deep model ---
+        restore_deep = st.session_state.pop("_restore_deep", None)
+        if restore_deep and restore_deep in deep_values:
+            st.session_state["deep_model_idx"] = deep_values.index(restore_deep)
 
         deep_idx = st.selectbox(
             "深度思考模型",
@@ -79,12 +110,34 @@ def _render_llm_config() -> None:
             key="deep_model_idx",
             help="用于辩论/决策等需要深度推理的任务",
         )
-        st.session_state["deep_think_llm"] = deep_values[deep_idx]
+        deep_val = deep_values[deep_idx]
     else:
-        custom_quick = st.text_input("快速思考模型 ID", key="custom_quick_model")
-        custom_deep = st.text_input("深度思考模型 ID", key="custom_deep_model")
-        st.session_state["quick_think_llm"] = custom_quick
-        st.session_state["deep_think_llm"] = custom_deep
+        # Custom provider — restore previous text values
+        restore_quick = st.session_state.pop("_restore_quick", None)
+        restore_deep = st.session_state.pop("_restore_deep", None)
+        quick_val = st.text_input(
+            "快速思考模型 ID",
+            value=restore_quick or "",
+            key="custom_quick_model",
+        )
+        deep_val = st.text_input(
+            "深度思考模型 ID",
+            value=restore_deep or "",
+            key="custom_deep_model",
+        )
+
+    st.session_state["quick_think_llm"] = quick_val
+    st.session_state["deep_think_llm"] = deep_val
+
+    # --- Persist to URL query params so choices survive browser refresh ---
+    if (
+        st.query_params.get("provider") != provider_key
+        or st.query_params.get("quick_model") != quick_val
+        or st.query_params.get("deep_model") != deep_val
+    ):
+        st.query_params["provider"] = provider_key
+        st.query_params["quick_model"] = quick_val
+        st.query_params["deep_model"] = deep_val
 
 
 def render_sidebar() -> None:
