@@ -22,7 +22,6 @@ from .alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_global_news as get_alpha_vantage_global_news,
 )
-from .alpha_vantage_common import AlphaVantageRateLimitError
 from .a_stock import (
     resolve_ticker,
     get_stock_data as get_astock_stock_data,
@@ -210,7 +209,15 @@ def get_vendor(category: str, method: str = None) -> str:
     return config.get("data_vendors", {}).get(category, "default")
 
 def route_to_vendor(method: str, *args, **kwargs):
-    """Route method calls to appropriate vendor implementation with fallback support."""
+    """Route method calls to appropriate vendor implementation with fallback support.
+
+    Vendors are tried in order: primary vendors (from config) first, then remaining
+    available vendors. Any exception (network error, data parse failure, etc.) triggers
+    fallback to the next vendor — not just AlphaVantage rate limits.
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
@@ -225,6 +232,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
+    last_error = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -234,7 +242,14 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+        except Exception as e:
+            last_error = e
+            _logger.warning(
+                "Vendor '%s' failed for method '%s': %s: %s",
+                vendor, method, type(e).__name__, e,
+            )
+            continue
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    raise RuntimeError(
+        f"All vendors failed for '{method}'. Last error: {type(last_error).__name__}: {last_error}"
+    )

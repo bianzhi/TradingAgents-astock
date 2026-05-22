@@ -40,15 +40,19 @@ DEFAULT_CONFIG = {
     "max_recur_limit": 100,
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
+    # Commas define priority: left = primary, right = fallback
+    # a_stock: A股专用(东财/腾讯/新浪/同花顺多源互备)
+    # yfinance: Yahoo Finance(海外市场,需科学上网)
+    # alpha_vantage: Alpha Vantage(需API key,有频率限制)
     "data_vendors": {
-        "core_stock_apis": "a_stock",        # Options: a_stock, alpha_vantage, yfinance
-        "technical_indicators": "a_stock",   # Options: a_stock, alpha_vantage, yfinance
-        "fundamental_data": "a_stock",       # Options: a_stock, alpha_vantage, yfinance
-        "news_data": "a_stock",              # Options: a_stock, alpha_vantage, yfinance
-        "signal_data": "a_stock",            # A-stock only: topic attribution, capital flow, consensus
+        "core_stock_apis": "a_stock,yfinance,alpha_vantage",
+        "technical_indicators": "a_stock,yfinance,alpha_vantage",
+        "fundamental_data": "a_stock,yfinance,alpha_vantage",
+        "news_data": "a_stock,yfinance,alpha_vantage",
+        "signal_data": "a_stock",              # A-stock only: topic attribution, capital flow, consensus
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
-        # Example: "get_stock_data": "alpha_vantage",  # Override category default
+        # Example: "get_stock_data": "a_stock,yfinance",  # Override category default
     },
 }

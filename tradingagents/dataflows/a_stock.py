@@ -331,17 +331,25 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
         "User-Agent": _UA,
         "Referer": "https://basic.10jqka.com.cn/",
     }
-    r = _requests.get(url, headers=headers, timeout=15,
-                      proxies=_NO_PROXY)
-    r.encoding = "gbk"
-    dfs = pd.read_html(r.text)
-    # Find the table containing EPS data
-    for df in dfs:
-        cols = [str(c) for c in df.columns]
-        if any("每股收益" in c or "均值" in c for c in cols):
-            return df
-    # Fallback: return first table if exists
-    return dfs[0] if dfs else pd.DataFrame()
+    try:
+        r = _requests.get(url, headers=headers, timeout=15,
+                          proxies=_NO_PROXY)
+        r.encoding = "gbk"
+        # 检测反爬: 如果返回的是完整 HTML 页面（而非数据表格），跳过
+        if "<!DOCTYPE" in r.text or "<html" in r.text.lower():
+            logger.warning("同花顺 EPS 页面返回 HTML (反爬), code=%s", code)
+            return pd.DataFrame()
+        dfs = pd.read_html(r.text)
+        # Find the table containing EPS data
+        for df in dfs:
+            cols = [str(c) for c in df.columns]
+            if any("每股收益" in c or "均值" in c for c in cols):
+                return df
+        # Fallback: return first table if exists
+        return dfs[0] if dfs else pd.DataFrame()
+    except Exception as e:
+        logger.warning("同花顺 EPS forecast failed for %s: %s", code, e)
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -1856,7 +1864,7 @@ def get_stock_data(
     )
 
     if df.empty:
-        return (
+        raise ValueError(
             f"No data found for A-stock '{code}' "
             f"between {start_date} and {end_date}. "
             f"All data sources (eastmoney/sina/tencent/tushare/mootdx) failed."
@@ -2027,6 +2035,7 @@ def get_fundamentals(
             logger.warning("mootdx finance failed for %s: %s", code, e)
 
         # --- Eastmoney push2: basic stock info (direct HTTP) ---
+        _push2_ok = False
         try:
             market_code = 1 if code.startswith("6") else 0
             _info_url = "http://push2.eastmoney.com/api/qt/stock/get"
@@ -2043,6 +2052,7 @@ def get_fundamentals(
             )
             d = r.json().get("data", {})
             if d:
+                _push2_ok = True
                 if d.get("f127"):
                     lines.append(f"行业: {d['f127']}")
                 if d.get("f84"):
@@ -2057,6 +2067,49 @@ def get_fundamentals(
                     lines.append(f"上市日期: {d['f189']}")
         except Exception as e:
             logger.warning("eastmoney push2 stock info failed for %s: %s", code, e)
+
+        # --- 备选: 东财 datacenter 获取行业/市值/股本 (push2 被阻断时) ---
+        if not _push2_ok:
+            try:
+                # 行业信息: 从东财 datacenter 个股信息获取
+                secid = _eastmoney_secid(code)
+                info_url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+                info_params = {
+                    "reportName": "RPT_F10_BASIC_ORGINFO",
+                    "columns": "SECURITY_CODE,EM_INDUSTRY,TOTAL_SHARES,LISTING_DATE",
+                    "filter": f'(SECURITY_CODE="{code}")',
+                    "pageNumber": 1,
+                    "pageSize": 1,
+                    "sortTypes": -1,
+                    "sortColumns": "UPDATE_DATE",
+                    "source": "HSF10",
+                    "client": "PC",
+                }
+                r = _requests.get(info_url, params=info_params,
+                                  headers={"User-Agent": _UA}, timeout=10,
+                                  proxies=_NO_PROXY)
+                d = r.json().get("result", {})
+                if d and d.get("data"):
+                    row = d["data"][0]
+                    if row.get("EM_INDUSTRY"):
+                        lines.append(f"行业: {row['EM_INDUSTRY']}")
+                    if row.get("TOTAL_SHARES"):
+                        lines.append(f"总股本: {row['TOTAL_SHARES']}")
+                    if row.get("LISTING_DATE"):
+                        lines.append(f"上市日期: {str(row['LISTING_DATE'])[:10]}")
+                    # 从腾讯 quote 补充市值
+                    try:
+                        tq2 = _tencent_quote([code])
+                        if code in tq2:
+                            q = tq2[code]
+                            if q.get("mcap_yi"):
+                                lines.append(f"总市值: {q['mcap_yi']}亿")
+                            if q.get("float_mcap_yi"):
+                                lines.append(f"流通市值: {q['float_mcap_yi']}亿")
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("datacenter stock info fallback failed for %s: %s", code, e)
 
         # --- 同花顺 direct HTTP: consensus EPS forecast ---
         try:
@@ -2131,7 +2184,7 @@ def get_fundamentals(
             logger.warning("Consensus EPS forecast failed for %s: %s", code, e)
 
         if not lines:
-            return f"No fundamentals data found for A-stock '{code}'"
+            raise ValueError(f"No fundamentals data found for A-stock '{code}'")
 
         header = f"# Company Fundamentals for {code} (A-stock)\n"
         header += (
@@ -2320,7 +2373,7 @@ def get_balance_sheet(
                     f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 )
                 return header + csv_string
-            return f"No balance sheet data found for A-stock '{code}'"
+            raise ValueError(f"No balance sheet data found for A-stock '{code}'")
 
         csv_string = df.to_csv(index=False)
 
@@ -2376,7 +2429,7 @@ def get_cashflow(
                     f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 )
                 return header + csv_string
-            return f"No cash flow data found for A-stock '{code}'"
+            raise ValueError(f"No cash flow data found for A-stock '{code}'")
 
         csv_string = df.to_csv(index=False)
 
@@ -2432,7 +2485,7 @@ def get_income_statement(
                     f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 )
                 return header + csv_string
-            return f"No income statement data found for A-stock '{code}'"
+            raise ValueError(f"No income statement data found for A-stock '{code}'")
 
         csv_string = df.to_csv(index=False)
 
@@ -2583,19 +2636,36 @@ def get_news(
             logger.warning("Sina news fetch failed for %s: %s", code, e)
 
     if not articles:
-        return f"No news found for A-stock '{code}'"
+        raise ValueError(f"No news found for A-stock '{code}'")
 
-    news_str = ""
-    count = 0
+    # Filter by date range, but keep all if date filter removes everything
+    filtered_articles = []
     for art in articles:
         pub_time = art.get("time", "")
         try:
             pub_dt = datetime.strptime(pub_time[:10], "%Y-%m-%d")
-            if pub_dt < start_dt or pub_dt > end_dt:
-                continue
+            if start_dt <= pub_dt <= end_dt:
+                filtered_articles.append(art)
         except (ValueError, IndexError):
-            pass
+            # 日期解析失败的新闻也保留
+            filtered_articles.append(art)
 
+    # 如果日期过滤后为空，使用全部新闻并提醒用户
+    if not filtered_articles and articles:
+        filtered_articles = articles
+        date_warn = (
+            f"⚠️ 请求日期范围 {start_date}~{end_date} 内无新闻，"
+            f"已返回全部可用新闻（共{len(articles)}条）。\n\n"
+        )
+    else:
+        date_warn = ""
+
+    if not filtered_articles:
+        raise ValueError(f"No news found for A-stock '{code}'")
+
+    news_str = ""
+    count = 0
+    for art in filtered_articles:
         title = art["title"]
         content = art.get("content", "")
         source = art.get("source", source_label)
@@ -2618,6 +2688,7 @@ def get_news(
 
     return (
         f"## {code} (A-stock) News, from {start_date} to {end_date}:\n\n"
+        + date_warn
         + news_str
     )
 
@@ -2695,7 +2766,7 @@ def get_global_news(
         logger.warning("Eastmoney global news fetch failed: %s", e)
 
     if not all_news:
-        return f"No global news found for {curr_date}"
+        raise ValueError(f"No global news found for {curr_date}")
 
     # Deduplicate by title
     seen: set[str] = set()
@@ -2827,7 +2898,7 @@ def get_insider_transactions(
             logger.warning("东财股东数据查询失败 for %s: %s", code, e)
 
     if not got_data:
-        return f"No insider/shareholder data found for A-stock '{code}'"
+        raise ValueError(f"No insider/shareholder data found for A-stock '{code}'")
 
     return "\n".join(lines)
 
@@ -2966,7 +3037,7 @@ def get_profit_forecast(
             logger.warning("东财利润表查询失败 for %s: %s", code, e)
 
     if not got_data:
-        return f"No profit forecast data found for A-stock '{code}'"
+        raise ValueError(f"No profit forecast data found for A-stock '{code}'")
 
     return "\n".join(lines)
 
@@ -3411,7 +3482,7 @@ def get_concept_blocks(
             pass
 
     if not got_data:
-        return f"No concept/block data available for {code}"
+        raise ValueError(f"No concept/block data available for {code}")
 
     return "\n".join(lines)
 
