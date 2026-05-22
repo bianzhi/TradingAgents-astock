@@ -27,11 +27,22 @@ import uuid
 import urllib.request
 
 import pandas as pd
-import requests as _requests
+import requests as _requests_module
+
+# 创建一个不读取环境变量代理的 Session，彻底避免 HTTP_PROXY 干扰国内数据源
+_requests = _requests_module.Session()
+_requests.trust_env = False
 
 from .utils import safe_ticker_component
 
 logger = logging.getLogger(__name__)
+
+# 代理绕行：东财/新浪/百度等国内数据源不需要走代理，且代理常导致超时或 503
+# 双重保障：1) 清除环境变量中的代理设置；2) 每个 request 调用显式传 proxies=_NO_PROXY
+for _proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+    os.environ.pop(_proxy_var, None)
+
+_NO_PROXY = {"http": None, "https": None}
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +225,12 @@ def _get_mootdx_client():
     if _mootdx_client is None:
         from mootdx.quotes import Quotes
 
-        _mootdx_client = Quotes.factory(market="std")
-    return _mootdx_client
+        try:
+            _mootdx_client = Quotes.factory(market="std")
+        except Exception as e:
+            logger.warning("mootdx client init failed (server unavailable): %s", e)
+            _mootdx_client = False  # sentinel: don't retry
+    return _mootdx_client if _mootdx_client is not False else None
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +307,8 @@ def _eastmoney_datacenter(
         "client": "WEB",
     }
     r = _requests.get(
-        _DATACENTER_URL, params=params, headers={"User-Agent": _UA}, timeout=15
+        _DATACENTER_URL, params=params, headers={"User-Agent": _UA}, timeout=15,
+        proxies=_NO_PROXY
     )
     d = r.json()
     if d.get("result") and d["result"].get("data"):
@@ -315,7 +331,8 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
         "User-Agent": _UA,
         "Referer": "https://basic.10jqka.com.cn/",
     }
-    r = _requests.get(url, headers=headers, timeout=15)
+    r = _requests.get(url, headers=headers, timeout=15,
+                      proxies=_NO_PROXY)
     r.encoding = "gbk"
     dfs = pd.read_html(r.text)
     # Find the table containing EPS data
@@ -363,7 +380,7 @@ def _eastmoney_kline(code: str, level: str = "daily",
     # 指数不需要复权 (fqt=0)，个股前复权 (fqt=1)
     fqt = "0" if _is_index_code(code) else "1"
 
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "secid": secid,
         "klt": str(klt),
@@ -376,13 +393,13 @@ def _eastmoney_kline(code: str, level: str = "daily",
 
     try:
         r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=30,
-                          proxies={"http": None, "https": None})
+                          proxies=_NO_PROXY)
         r.raise_for_status()
     except Exception as e:
         # SSL errors common in some environments — try without verify
         try:
             r = _requests.get(url, params=params, headers={"User-Agent": _UA},
-                              timeout=30, verify=False, proxies={"http": None, "https": None})
+                              timeout=30, verify=False, proxies=_NO_PROXY)
             r.raise_for_status()
         except Exception:
             logger.warning("Eastmoney kline failed for %s/%s: %s", code, level, e)
@@ -445,7 +462,7 @@ def _sina_kline(code: str, level: str = "daily",
         "Referer": "https://finance.sina.com.cn/",
     }
     r = _requests.get(url, params=params, headers=headers, timeout=30,
-                      proxies={"http": None, "https": None})
+                      proxies=_NO_PROXY)
     if r.status_code in (403, 456):
         # 新浪反爬封禁（456=IP异常访问），直接返回空，不抛异常
         logger.debug("Sina kline blocked for %s (HTTP %s)", code, r.status_code)
@@ -519,13 +536,13 @@ def _tencent_kline(code: str, level: str = "daily",
 
     try:
         r = _requests.get(url, params=params, headers=headers, timeout=30,
-                          proxies={"http": None, "https": None})
+                          proxies=_NO_PROXY)
         r.raise_for_status()
     except Exception as e:
         # SSL errors — retry without verify
         try:
             r = _requests.get(url, params=params, headers=headers, timeout=30,
-                              verify=False, proxies={"http": None, "https": None})
+                              verify=False, proxies=_NO_PROXY)
             r.raise_for_status()
         except Exception:
             logger.warning("Tencent kline failed for %s/%s: %s", code, level, e)
@@ -1089,7 +1106,7 @@ def get_sector_list(sector_type: str = "industry") -> list[dict]:
     fs_map = {"industry": "m:90+t:2", "concept": "m:90+t:3"}
     fs = fs_map.get(sector_type, "m:90+t:2")
 
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    url = "http://push2.eastmoney.com/api/qt/clist/get"
     params = {
         "pn": "1",
         "pz": "500",
@@ -1106,12 +1123,13 @@ def get_sector_list(sector_type: str = "industry") -> list[dict]:
     while True:
         params["pn"] = str(page)
         try:
-            r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
+            r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15,
+                              proxies=_NO_PROXY)
             r.raise_for_status()
         except Exception:
             try:
                 r = _requests.get(url, params=params, headers={"User-Agent": _UA},
-                                  timeout=15, verify=False)
+                                  timeout=15, verify=False, proxies=_NO_PROXY)
                 r.raise_for_status()
             except Exception:
                 break
@@ -1152,7 +1170,7 @@ def _eastmoney_sector_kline(
     secid = f"90.{sector_code}"
     klt = _EASTMONEY_KLT.get(level, 101)
 
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "secid": secid,
         "klt": str(klt),
@@ -1164,12 +1182,13 @@ def _eastmoney_sector_kline(
     }
 
     try:
-        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=30)
+        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=30,
+                          proxies=_NO_PROXY)
         r.raise_for_status()
     except Exception as e:
         try:
             r = _requests.get(url, params=params, headers={"User-Agent": _UA},
-                              timeout=30, verify=False)
+                              timeout=30, verify=False, proxies=_NO_PROXY)
             r.raise_for_status()
         except Exception:
             logger.warning("Eastmoney sector kline failed for %s/%s: %s", sector_code, level, e)
@@ -1717,7 +1736,7 @@ def get_fundamentals(
         # --- Eastmoney push2: basic stock info (direct HTTP) ---
         try:
             market_code = 1 if code.startswith("6") else 0
-            _info_url = "https://push2.eastmoney.com/api/qt/stock/get"
+            _info_url = "http://push2.eastmoney.com/api/qt/stock/get"
             _info_params = {
                 "fltt": "2",
                 "invt": "2",
@@ -1727,6 +1746,7 @@ def get_fundamentals(
             r = _requests.get(
                 _info_url, params=_info_params,
                 headers={"User-Agent": _UA}, timeout=10,
+                proxies=_NO_PROXY
             )
             d = r.json().get("data", {})
             if d:
@@ -1845,6 +1865,10 @@ def _get_financial_report_sina(
     """Shared helper: fetch financial report via Sina direct HTTP API.
 
     report_type: '资产负债表' | '利润表' | '现金流量表'
+
+    Sina 2025 API returns:
+      result.data.report_list: {"20250930": {"data": [{item_field, item_title, item_value, ...}], ...}, ...}
+      result.data.report_date: [{"date_value": "20250930", "date_description": "2025三季报", "date_type": 3}, ...]
     """
     _report_type_map = {
         "资产负债表": "fzb",
@@ -1863,26 +1887,67 @@ def _get_financial_report_sina(
         "page": "1",
         "num": "20",
     }
-    r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
+    r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15,
+                      proxies=_NO_PROXY)
     d = r.json()
 
-    result = d.get("result", {}).get("data", {})
-    items = result.get(source_type, [])
-    if not isinstance(items, list) or not items:
+    result_data = d.get("result", {}).get("data", {})
+
+    # New API format: report_list is a dict keyed by report date
+    report_list = result_data.get("report_list", {})
+    if not isinstance(report_list, dict) or not report_list:
+        # Old API fallback (unlikely but safe)
+        items = result_data.get(source_type, [])
+        if isinstance(items, list) and items:
+            df = pd.DataFrame(items)
+            if curr_date and "报告日" in df.columns:
+                df["报告日"] = pd.to_datetime(df["报告日"], errors="coerce")
+                cutoff = pd.to_datetime(curr_date)
+                df = df[df["报告日"] <= cutoff]
+            return df.head(8)
         return pd.DataFrame()
 
-    df = pd.DataFrame(items)
+    # Parse new format: build a flat DataFrame from report_list
+    rows = []
+    for date_key, report in report_list.items():
+        if not isinstance(report, dict):
+            continue
+        items = report.get("data", [])
+        if not isinstance(items, list):
+            continue
 
-    # Filter by curr_date
-    if curr_date and "报告日" in df.columns:
-        df["报告日"] = pd.to_datetime(df["报告日"], errors="coerce")
-        cutoff = pd.to_datetime(curr_date)
-        df = df[df["报告日"] <= cutoff]
+        # Filter by freq: 1231 = annual report
+        is_annual = date_key.endswith("1231")
+        if freq.lower() == "annual" and not is_annual:
+            continue
 
-    # Filter by frequency (annual = month 12 reports only)
-    if freq.lower() == "annual" and "报告日" in df.columns:
-        months = pd.to_datetime(df["报告日"], errors="coerce").dt.month
-        df = df[months == 12]
+        # Filter by curr_date
+        if curr_date:
+            try:
+                report_dt = pd.to_datetime(date_key)
+                cutoff = pd.to_datetime(curr_date)
+                if report_dt > cutoff:
+                    continue
+            except Exception:
+                pass
+
+        # Build row: report date + key items as columns
+        row = {"报告日": date_key}
+        for item in items:
+            title = item.get("item_title", "")
+            value = item.get("item_value")
+            row[title] = value
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Convert 报告日 to proper date format
+    try:
+        df["报告日"] = pd.to_datetime(df["报告日"], format="%Y%m%d")
+    except Exception:
+        pass
 
     return df.head(8)
 
@@ -2002,7 +2067,7 @@ def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
         },
     }
     params = {
-        "cb": "callback",
+        "cb": "jQuery",
         "param": _json.dumps(inner_param, ensure_ascii=False),
         "_": "1",
     }
@@ -2014,7 +2079,8 @@ def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
         ),
     }
 
-    resp = _requests.get(url, params=params, headers=headers, timeout=15)
+    resp = _requests.get(url, params=params, headers=headers, timeout=15,
+                         proxies=_NO_PROXY)
     resp.raise_for_status()
     text = resp.text
     text = text[text.index("(") + 1 : text.rindex(")")]
@@ -2047,7 +2113,8 @@ def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
         "Referer": "https://finance.sina.com.cn/",
     }
 
-    resp = _requests.get(url, headers=headers, timeout=15)
+    resp = _requests.get(url, headers=headers, timeout=15,
+                         proxies=_NO_PROXY)
     resp.raise_for_status()
     resp.encoding = "gb2312"
     html = resp.text
@@ -2157,7 +2224,8 @@ def get_global_news(
         cls_url = "https://www.cls.cn/nodeapi/telegraphList"
         cls_params = {"rn": str(limit), "page": "1"}
         cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
-        r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
+        r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10,
+                              proxies=_NO_PROXY)
         d_cls = r_cls.json()
         for item in d_cls.get("data", {}).get("roll_data", []):
             title = item.get("title", "") or item.get("brief", "")
@@ -2191,7 +2259,8 @@ def get_global_news(
             "req_trace": str(uuid.uuid4()),
         }
         em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
-        r_em = _requests.get(em_url, params=em_params, headers=em_headers, timeout=10)
+        r_em = _requests.get(em_url, params=em_params, headers=em_headers, timeout=10,
+                             proxies=_NO_PROXY)
         d_em = r_em.json()
         for item in d_em.get("data", {}).get("fastNewsList", []):
             title = item.get("title", "")
@@ -2633,70 +2702,98 @@ _BAIDU_PAE_HEADERS = {
 def get_concept_blocks(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:
-    """Get concept/sector/region blocks that a stock belongs to (百度股市通).
+    """Get concept/sector/region blocks that a stock belongs to.
 
-    Returns industry classification (申万), concept themes, and region.
-    Each block includes current day's change percentage.
+    Primary: 百度股市通 PAE; Fallback: 东财 emweb (industry info).
+    Returns industry classification (东财/申万), concept themes, and region.
     """
-    import requests
-
     code = _normalize_ticker(ticker)
+    market = "SZ" if code.startswith(("0", "3")) else "SH"
+    lines = [
+        f"# Concept & Sector Blocks for {code} (A-stock)",
+        f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    got_data = False
 
+    # Source 1: 百度 PAE (primary)
     try:
         url = (
             "https://finance.pae.baidu.com/api/getrelatedblock"
             f'?stock=[{{"code":"{code}","market":"ab","type":"stock"}}]'
             "&finClientType=pc"
         )
-        r = requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=10)
+        r = _requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=10,
+                         proxies=_NO_PROXY)
         d = r.json()
 
-        if str(d.get("ResultCode", -1)) != "0":
-            return (
-                f"Baidu PAE error: ResultCode={d.get('ResultCode')} "
-                f"{d.get('ResultMsg', '')}"
+        if str(d.get("ResultCode", -1)) == "0":
+            result = d.get("Result", {})
+            categories = result.get(code, [])
+            concept_names: list[str] = []
+
+            for cat in categories:
+                cat_name = cat.get("name", "")
+                items = cat.get("list", [])
+                if not items:
+                    continue
+                lines.append(f"## {cat_name}")
+                for item in items:
+                    name = item.get("name", "")
+                    ratio = item.get("ratio", "")
+                    desc = item.get("describe", "")
+                    suffix = f" ({desc})" if desc else ""
+                    lines.append(f"  {name}{suffix}: {ratio}")
+                    if cat_name == "概念":
+                        concept_names.append(name)
+
+            if concept_names:
+                lines.append(f"\nConcept tags: {' / '.join(concept_names)}")
+            lines.append("\n# Source: 百度股市通 (Baidu PAE)")
+            got_data = True
+    except Exception:
+        pass
+
+    # Source 2: 东财 emweb (fallback — industry info)
+    if not got_data:
+        try:
+            emw_url = (
+                f"http://emweb.securities.eastmoney.com"
+                f"/PC_HSF10/CompanySurvey/PageAjax?code={market}{code}"
             )
+            r = _requests.get(emw_url, timeout=10, proxies=_NO_PROXY)
+            d = r.json()
+            jbzl_list = d.get("jbzl", [])
+            if jbzl_list:
+                jbzl = jbzl_list[0] if isinstance(jbzl_list, list) else jbzl_list
+                em_industry = jbzl.get("EM2016", "")
+                csrc_industry = jbzl.get("INDUSTRYCSRC1", "")
+                province = jbzl.get("PROVINCE", "")
+                org_profile = jbzl.get("ORG_PROFILE", "")
 
-        result = d.get("Result", {})
-        categories = result.get(code, [])
-        if not categories:
-            return f"No concept/block data for {code}"
+                if em_industry:
+                    lines.append("## 行业 (东财)")
+                    for level in em_industry.split("-"):
+                        lines.append(f"  {level}")
+                if csrc_industry:
+                    lines.append("\n## 行业 (申万)")
+                    for level in csrc_industry.split("-"):
+                        lines.append(f"  {level}")
+                if province:
+                    lines.append(f"\n## 地区")
+                    lines.append(f"  {province}")
+                if org_profile:
+                    lines.append("\n## 公司简介")
+                    lines.append(f"  {org_profile[:200]}")
+                lines.append("\n# Source: 东财 emweb (Baidu PAE 不可用时的备选)")
+                got_data = True
+        except Exception:
+            pass
 
-        lines = [
-            f"# Concept & Sector Blocks for {code} (A-stock)",
-            f"# Source: 百度股市通 (Baidu PAE)",
-            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-        ]
+    if not got_data:
+        return f"No concept/block data available for {code}"
 
-        concept_names: list[str] = []
-
-        for cat in categories:
-            cat_name = cat.get("name", "")
-            items = cat.get("list", [])
-            if not items:
-                continue
-            lines.append(f"## {cat_name}")
-            for item in items:
-                name = item.get("name", "")
-                ratio = item.get("ratio", "")
-                desc = item.get("describe", "")
-                suffix = f" ({desc})" if desc else ""
-                lines.append(f"  {name}{suffix}: {ratio}")
-                if cat_name == "概念":
-                    concept_names.append(name)
-
-        if concept_names:
-            lines.append(f"\nConcept tags: {' / '.join(concept_names)}")
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"Error fetching concept blocks for {code}: {str(e)}"
-
-
-# ---- 14. get_fund_flow ----
-
+    return "\n".join(lines)
 
 def get_fund_flow(
     ticker: Annotated[str, "A-stock code"],
@@ -2713,8 +2810,6 @@ def get_fund_flow(
     V0.2.7: replaced 百度 PAE (fundflow/fundsortlist, offline since 2026-05)
     with 东财 push2 fund flow API.
     """
-    import requests as _req
-
     code = _normalize_ticker(ticker)
     secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
     lines = [
@@ -2724,15 +2819,18 @@ def get_fund_flow(
         "",
     ]
 
+    _push2_headers = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
+
     try:
         # Realtime minute-level fund flow
-        url_rt = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+        url_rt = "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
         params_rt = {
             "secid": secid, "klt": 1,
             "fields1": "f1,f2,f3,f7",
             "fields2": "f51,f52,f53,f54,f55,f56,f57",
         }
-        r = _req.get(url_rt, params=params_rt, timeout=10)
+        r = _requests.get(url_rt, params=params_rt, headers=_push2_headers, timeout=10,
+                          proxies=_NO_PROXY)
         d = r.json()
         klines = d.get("data", {}).get("klines", [])
 
@@ -2773,7 +2871,7 @@ def get_fund_flow(
         # Historical daily fund flow (push2his)
         if include_history:
             url_hist = (
-                "https://push2his.eastmoney.com"
+                "http://push2his.eastmoney.com"
                 "/api/qt/stock/fflow/daykline/get"
             )
             params_hist = {
@@ -2781,8 +2879,9 @@ def get_fund_flow(
                 "fields1": "f1,f2,f3,f7",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57",
             }
-            rh = _req.get(
-                url_hist, params=params_hist, timeout=10
+            rh = _requests.get(
+                url_hist, params=params_hist, headers=_push2_headers, timeout=10,
+                proxies=_NO_PROXY
             )
             dh = rh.json()
             hist_klines = dh.get("data", {}).get("klines", [])
@@ -3048,7 +3147,7 @@ def get_industry_comparison(
 
     # 东财 push2 行业板块排名 (direct HTTP, replaces 同花顺 which has 401)
     try:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        url = "http://push2.eastmoney.com/api/qt/clist/get"
         params = {
             "pn": "1",
             "pz": "100",
@@ -3059,7 +3158,8 @@ def get_industry_comparison(
             "fs": "m:90+t:2",
             "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207",
         }
-        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
+        r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15,
+                          proxies=_NO_PROXY)
         d = r.json()
         items = d.get("data", {}).get("diff", [])
 
@@ -3090,6 +3190,8 @@ def get_industry_comparison(
             lines.append("行业数据获取为空。")
     except Exception as e:
         lines.append(f"行业对比查询失败: {e}")
+
+    return "\n".join(lines)
 
 
 # ===========================================================================
