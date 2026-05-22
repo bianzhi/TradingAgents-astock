@@ -1159,32 +1159,43 @@ def _cache_dir() -> str:
     return cache_dir
 
 
+# ---------------------------------------------------------------------------
+#  SQLite-backed cache (replaces CSV + JSON)
+# ---------------------------------------------------------------------------
+
+from .kline_cache import (  # noqa: E402
+    load_kline as _db_load,
+    save_kline as _db_save,
+    incremental_update as _db_incremental,
+    get_latest_date as _db_latest_date,
+    get_meta as _db_get_meta,
+    list_cached as _db_list_cached,
+    delete_kline as _db_delete,
+    migrate_csv_to_sqlite as _db_migrate,
+)
+
+
 def _daily_cache_path(code: str, level: str = "daily") -> str:
-    """Return the K-line CSV path for a stock code and level."""
+    """Return the K-line CSV path for a stock code and level (legacy compat)."""
     return os.path.join(_cache_dir(), f"{code}-astock-{level}.csv")
 
 
 def _daily_meta_path(code: str, level: str = "daily") -> str:
-    """Return the K-line metadata JSON path."""
+    """Return the K-line metadata JSON path (legacy compat)."""
     return os.path.join(_cache_dir(), f"{code}-astock-{level}-meta.json")
 
 
 def sync_stock_data(code: str, level: str = "daily",
                     datalen: int = 10000, start_date: str = None,
                     sources: list[str] | None = None) -> dict:
-    """全量同步单只股票的K线数据到本地缓存。四大数据源自动协同，主源失败自动切换备源。
-
-    数据源与级别支持:
-        - 东方财富 (1分~日线, 日线最多10000根, 分钟级最优)
-        - 新浪财经 (1分~日线, 速度快, 最多2000根)
-        - 腾讯财经 (1分~周线, 稳定, 最多2000根)
-        - Tushare  (1分~月线, 数据质量最高, 需 token)
+    """同步单只股票的K线数据到本地 SQLite 缓存。增量更新：优先用缓存，仅拉取新增部分。
 
     同步策略:
-        - 分钟级: 东方财富 → 新浪 → 腾讯 → Tushare
-        - 日线/周线/月线: 新浪 → 腾讯 → Tushare → 东方财富
-        - 周线/月线: 优先直接获取，失败则从日线重采样确保完整性
-        - 全部失败: mootdx TCP 兜底 (最多800根)
+        1. 查询本地 SQLite 缓存最新日期
+        2. 如有缓存且数据较新（当天或上一交易日），直接返回缓存数据
+        3. 如缓存不是最新，仅拉取最新日期之后的数据（增量），合并写入
+        4. 无缓存则全量拉取
+        5. 主源失败自动切换备源（东财→新浪→腾讯→Tushare→同花顺5min聚合→东财trends2→mootdx TCP）
 
     Args:
         code: 6位股票代码
@@ -1202,12 +1213,11 @@ def sync_stock_data(code: str, level: str = "daily",
             "date_range": ["2008-06-12", "2025-06-15"],
             "source": "sina",
             "status": "ok" | "error",
-            "error": None | "error message"
+            "error": None | "error message",
+            "incremental": True | False   # 是否为增量更新
         }
     """
     code = _normalize_ticker(code)
-    cache_file = _daily_cache_path(code, level)
-    meta_file = _daily_meta_path(code, level)
 
     # Resolve start_date
     if not start_date:
@@ -1215,7 +1225,64 @@ def sync_stock_data(code: str, level: str = "daily",
         config = get_config()
         start_date = config.get("kline_start_date", "2024-01-01")
 
-    # Get K-line data using multi-source fetcher
+    # ── Step 1: Check SQLite cache — 增量更新 ──
+    cached_latest = _db_latest_date(code, level, "stock")
+    is_minute = level.endswith("min")
+    now = datetime.now()
+
+    if cached_latest:
+        cache_dt = pd.to_datetime(cached_latest)
+        if is_minute:
+            # 分钟级：缓存最新时间在1小时内视为最新（盘中实时）
+            is_fresh = (now - cache_dt).total_seconds() < 3600
+        else:
+            # 日线级别：缓存最新日期是今天或昨天（含周末/节假日），视为最新
+            is_fresh = (now.date() - cache_dt.date()).days <= 1
+
+        if is_fresh:
+            # 缓存已是最新，直接返回
+            meta = _db_get_meta(code, level, "stock")
+            if meta and meta.get("rows", 0) > 0:
+                logger.info("Cache fresh for %s/%s (latest=%s, rows=%d), skip fetch",
+                            code, level, cached_latest, meta["rows"])
+                result = dict(meta)
+                result["status"] = "ok"
+                result["error"] = None
+                result["incremental"] = False
+                return result
+
+        # 缓存过期但有旧数据 → 增量拉取
+        # 用缓存最新日期 +1 天作为增量起始
+        if is_minute:
+            inc_start = (cache_dt + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        else:
+            inc_start = (cache_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.info("Incremental update for %s/%s: cached latest=%s, fetching from %s",
+                    code, level, cached_latest, inc_start)
+        df, source_name = _fetch_kline(
+            code, level=level, start_date=inc_start,
+            datalen=datalen, sources=sources,
+        )
+
+        if df.empty:
+            # 增量获取为空 → 可能无新交易日，返回缓存
+            meta = _db_get_meta(code, level, "stock")
+            if meta and meta.get("rows", 0) > 0:
+                result = dict(meta)
+                result["status"] = "ok"
+                result["error"] = None
+                result["incremental"] = False
+                logger.info("No new data for %s/%s, returning cache", code, level)
+                return result
+
+        if not df.empty:
+            # 增量合并写入 SQLite
+            result = _db_incremental(df, code, level, data_type="stock",
+                                     source=source_name, start_date=start_date)
+            result["incremental"] = True
+            return result
+
+    # ── Step 2: 全量拉取（无缓存或缓存不可用）──
     df, source_name = _fetch_kline(
         code, level=level, start_date=start_date,
         datalen=datalen, sources=sources,
@@ -1259,42 +1326,14 @@ def sync_stock_data(code: str, level: str = "daily",
             "code": code, "level": level, "rows": 0,
             "date_range": [], "source": "none",
             "status": "error", "error": "所有数据源均无法获取数据",
+            "incremental": False,
         }
 
-    # Save CSV
-    df.to_csv(cache_file, index=False, encoding="utf-8")
-
-    # Save meta — 分钟级日期含时分，日线及以上只含日期
-    import json as _json_mod
-    is_minute = level.endswith("min")
-    fmt = "%Y-%m-%d %H:%M" if is_minute else "%Y-%m-%d"
-    date_min = pd.to_datetime(df["Date"].min())
-    date_max = pd.to_datetime(df["Date"].max())
-    meta = {
-        "code": code,
-        "level": level,
-        "rows": len(df),
-        "date_range": [
-            date_min.strftime(fmt),
-            date_max.strftime(fmt),
-        ],
-        "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": source_name,
-        "datalen": datalen,
-        "start_date": start_date,
-    }
-    with open(meta_file, "w", encoding="utf-8") as f:
-        _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
-
-    return {
-        "code": code,
-        "level": level,
-        "rows": len(df),
-        "date_range": meta["date_range"],
-        "source": source_name,
-        "status": "ok",
-        "error": None,
-    }
+    # Save to SQLite
+    result = _db_save(df, code, level, data_type="stock",
+                      source=source_name, start_date=start_date)
+    result["incremental"] = False
+    return result
 
 
 def get_cached_stocks() -> list[dict]:
@@ -1303,53 +1342,7 @@ def get_cached_stocks() -> list[dict]:
     Returns:
         [{"code": "300750", "level": "daily", "rows": 3200, ...}, ...]
     """
-    cache_dir = _cache_dir()
-    import json as _json_mod
-
-    results = []
-    if not os.path.exists(cache_dir):
-        return results
-
-    for meta_file in sorted(os.listdir(cache_dir)):
-        if not meta_file.endswith("-meta.json") or "-astock-" not in meta_file:
-            continue
-        meta_path = os.path.join(cache_dir, meta_file)
-        # Infer level from filename: {code}-astock-{level}-meta.json
-        base = meta_file.replace("-meta.json", "")
-        parts = base.split("-astock-")
-        inferred_level = parts[1] if len(parts) == 2 else "daily"
-
-        try:
-            with open(meta_path, encoding="utf-8") as f:
-                meta = _json_mod.load(f)
-            # Backfill missing fields for old caches
-            if "level" not in meta:
-                meta["level"] = inferred_level
-            if "start_date" not in meta:
-                meta["start_date"] = ""
-            results.append(meta)
-        except Exception:
-            # Fallback: infer from CSV
-            if len(parts) == 2:
-                code, level = parts
-                csv_path = os.path.join(cache_dir, f"{code}-astock-{level}.csv")
-                if os.path.exists(csv_path):
-                    try:
-                        df = pd.read_csv(csv_path, encoding="utf-8", on_bad_lines="skip")
-                        mtime = os.path.getmtime(csv_path)
-                        results.append({
-                            "code": code,
-                            "level": level,
-                            "rows": len(df),
-                            "date_range": [df.iloc[0]["Date"], df.iloc[-1]["Date"]] if len(df) > 0 else [],
-                            "last_sync": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                            "source": "unknown",
-                            "start_date": "",
-                        })
-                    except Exception:
-                        pass
-
-    return results
+    return _db_list_cached(data_type="stock")
 
 
 def delete_cache(code: str, level: str | None = None) -> bool:
@@ -1360,25 +1353,9 @@ def delete_cache(code: str, level: str | None = None) -> bool:
         level: K线级别，None则删除所有级别
 
     Returns:
-        True if any file was deleted, False otherwise.
+        True if any record was deleted, False otherwise.
     """
-    deleted = False
-    if level:
-        for path in [_daily_cache_path(code, level), _daily_meta_path(code, level)]:
-            if os.path.exists(path):
-                os.remove(path)
-                deleted = True
-    else:
-        # Delete all levels for this code
-        cache_dir = _cache_dir()
-        if os.path.exists(cache_dir):
-            for f in os.listdir(cache_dir):
-                if f.startswith(f"{code}-astock-") and (
-                    f.endswith(".csv") or f.endswith("-meta.json")
-                ):
-                    os.remove(os.path.join(cache_dir, f))
-                    deleted = True
-    return deleted
+    return _db_delete(code, level=level, data_type="stock")
 
 
 # ---------------------------------------------------------------------------
@@ -1532,7 +1509,7 @@ def sync_sector_data(
     datalen: int = 10000,
     start_date: str = None,
 ) -> dict:
-    """同步板块K线数据到本地缓存。
+    """同步板块K线数据到本地 SQLite 缓存。支持增量更新。
 
     Args:
         sector_code: 板块代码 (如 BK0428)
@@ -1544,15 +1521,55 @@ def sync_sector_data(
     Returns:
         同步结果 dict (与 sync_stock_data 格式一致)
     """
-    cache_file = _sector_cache_path(sector_code, level)
-    meta_file = _sector_meta_path(sector_code, level)
-
     if not start_date:
         from .config import get_config
         config = get_config()
         start_date = config.get("kline_start_date", "2024-01-01")
 
-    # 板块K线只有东财源
+    # ── 增量检查 ──
+    cached_latest = _db_latest_date(sector_code, level, "sector")
+    is_minute = level.endswith("min")
+    now = datetime.now()
+
+    if cached_latest:
+        cache_dt = pd.to_datetime(cached_latest)
+        if is_minute:
+            is_fresh = (now - cache_dt).total_seconds() < 3600
+        else:
+            is_fresh = (now.date() - cache_dt.date()).days <= 1
+
+        if is_fresh:
+            meta = _db_get_meta(sector_code, level, "sector")
+            if meta and meta.get("rows", 0) > 0:
+                meta["status"] = "ok"
+                meta["error"] = None
+                meta["name"] = sector_name or meta.get("name", "")
+                meta["incremental"] = False
+                return meta
+
+        # 增量拉取
+        if is_minute:
+            inc_start = (cache_dt + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        else:
+            inc_start = (cache_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        df = _eastmoney_sector_kline(
+            sector_code, level=level, start_date=inc_start, datalen=datalen,
+        )
+        if not df.empty:
+            result = _db_incremental(df, sector_code, level, data_type="sector",
+                                     source="eastmoney", start_date=start_date,
+                                     name=sector_name)
+            result["incremental"] = True
+            return result
+        # 增量为空 → 返回缓存
+        meta = _db_get_meta(sector_code, level, "sector")
+        if meta and meta.get("rows", 0) > 0:
+            meta["status"] = "ok"
+            meta["error"] = None
+            meta["incremental"] = False
+            return meta
+
+    # ── 全量拉取 ──
     df = _eastmoney_sector_kline(
         sector_code, level=level, start_date=start_date, datalen=datalen,
     )
@@ -1564,81 +1581,21 @@ def sync_sector_data(
             "status": "error", "error": "东方财富无法获取该板块K线数据",
         }
 
-    df.to_csv(cache_file, index=False, encoding="utf-8")
-
-    import json as _json_mod
-    is_minute = level.endswith("min")
-    fmt = "%Y-%m-%d %H:%M" if is_minute else "%Y-%m-%d"
-    date_min = pd.to_datetime(df["Date"].min())
-    date_max = pd.to_datetime(df["Date"].max())
-    meta = {
-        "code": sector_code,
-        "name": sector_name,
-        "level": level,
-        "rows": len(df),
-        "date_range": [
-            date_min.strftime(fmt),
-            date_max.strftime(fmt),
-        ],
-        "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "eastmoney",
-        "data_type": "sector",
-        "datalen": datalen,
-        "start_date": start_date,
-    }
-    with open(meta_file, "w", encoding="utf-8") as f:
-        _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
-
-    return {
-        "code": sector_code,
-        "name": sector_name,
-        "level": level,
-        "rows": len(df),
-        "date_range": meta["date_range"],
-        "source": "eastmoney",
-        "status": "ok",
-        "error": None,
-    }
+    result = _db_save(df, sector_code, level, data_type="sector",
+                      source="eastmoney", start_date=start_date,
+                      name=sector_name)
+    result["incremental"] = False
+    return result
 
 
 def get_cached_sectors() -> list[dict]:
     """列出所有已缓存的板块数据。"""
-    cache_dir = _cache_dir()
-    if not os.path.exists(cache_dir):
-        return []
-
-    results = []
-    for f in os.listdir(cache_dir):
-        if not f.endswith("-sector-meta.json"):
-            continue
-        try:
-            with open(os.path.join(cache_dir, f), encoding="utf-8") as fh:
-                meta = _json.load(fh)
-            meta["data_type"] = "sector"
-            results.append(meta)
-        except Exception:
-            pass
-    return results
+    return _db_list_cached(data_type="sector")
 
 
 def delete_sector_cache(sector_code: str, level: str | None = None) -> bool:
     """删除指定板块的缓存数据。"""
-    deleted = False
-    if level:
-        for path in [_sector_cache_path(sector_code, level), _sector_meta_path(sector_code, level)]:
-            if os.path.exists(path):
-                os.remove(path)
-                deleted = True
-    else:
-        cache_dir = _cache_dir()
-        if os.path.exists(cache_dir):
-            for f in os.listdir(cache_dir):
-                if f.startswith(f"{sector_code}-sector-") and (
-                    f.endswith(".csv") or f.endswith("-meta.json")
-                ):
-                    os.remove(os.path.join(cache_dir, f))
-                    deleted = True
-    return deleted
+    return _db_delete(sector_code, level=level, data_type="sector")
 
 
 # ---------------------------------------------------------------------------
@@ -1671,15 +1628,12 @@ def sync_index_data(
     datalen: int = 10000,
     start_date: str = None,
 ) -> dict:
-    """同步指数K线数据到本地缓存。
-
-    指数走 sync_stock_data 的多源获取逻辑（东财/新浪/腾讯/Tushare），
-    但缓存文件单独存放为 {code}-index-{level}.csv，避免与个股缓存混淆。
+    """同步指数K线数据到本地 SQLite 缓存。支持增量更新。
 
     Args:
         index_code: 指数代码 (如 000001, 399001)
         index_name: 指数名称 (如 上证指数)
-        level: K线级别 (1min/5min/15min/30min/60min/daily/weekly/monthly)
+        level: K线级别
         datalen: 最大K线数量
         start_date: 起始日期
 
@@ -1691,10 +1645,50 @@ def sync_index_data(
         config = get_config()
         start_date = config.get("kline_start_date", "2024-01-01")
 
-    # 使用多源获取逻辑（已支持指数 secid/fqt）
+    # ── 增量检查 ──
+    cached_latest = _db_latest_date(index_code, level, "index")
+    is_minute = level.endswith("min")
+    now = datetime.now()
+
+    if cached_latest:
+        cache_dt = pd.to_datetime(cached_latest)
+        if is_minute:
+            is_fresh = (now - cache_dt).total_seconds() < 3600
+        else:
+            is_fresh = (now.date() - cache_dt.date()).days <= 1
+
+        if is_fresh:
+            meta = _db_get_meta(index_code, level, "index")
+            if meta and meta.get("rows", 0) > 0:
+                meta["status"] = "ok"
+                meta["error"] = None
+                meta["name"] = index_name or meta.get("name", "")
+                meta["incremental"] = False
+                return meta
+
+        # 增量拉取
+        if is_minute:
+            inc_start = (cache_dt + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        else:
+            inc_start = (cache_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        df, src = _fetch_kline(index_code, level=level, start_date=inc_start, datalen=datalen)
+        if not df.empty:
+            result = _db_incremental(df, index_code, level, data_type="index",
+                                     source=src, start_date=start_date,
+                                     name=index_name)
+            result["incremental"] = True
+            return result
+        # 增量为空 → 返回缓存
+        meta = _db_get_meta(index_code, level, "index")
+        if meta and meta.get("rows", 0) > 0:
+            meta["status"] = "ok"
+            meta["error"] = None
+            meta["incremental"] = False
+            return meta
+
+    # ── 全量拉取 ──
     df, source_name = _fetch_kline(
-        index_code, level=level, start_date=start_date,
-        datalen=datalen,
+        index_code, level=level, start_date=start_date, datalen=datalen,
     )
 
     # 周线/月线：尝试从日线重采样
@@ -1714,104 +1708,67 @@ def sync_index_data(
             "status": "error", "error": "所有数据源均无法获取该指数K线数据",
         }
 
-    cache_file = _index_cache_path(index_code, level)
-    meta_file = _index_meta_path(index_code, level)
-
-    df.to_csv(cache_file, index=False, encoding="utf-8")
-
-    import json as _json_mod
-    is_minute = level.endswith("min")
-    fmt = "%Y-%m-%d %H:%M" if is_minute else "%Y-%m-%d"
-    date_min = pd.to_datetime(df["Date"].min())
-    date_max = pd.to_datetime(df["Date"].max())
-    meta = {
-        "code": index_code,
-        "name": index_name,
-        "level": level,
-        "rows": len(df),
-        "date_range": [date_min.strftime(fmt), date_max.strftime(fmt)],
-        "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": source_name,
-        "data_type": "index",
-        "datalen": datalen,
-        "start_date": start_date,
-    }
-    with open(meta_file, "w", encoding="utf-8") as f:
-        _json_mod.dump(meta, f, ensure_ascii=False, indent=2)
-
-    return {
-        "code": index_code,
-        "name": index_name,
-        "level": level,
-        "rows": len(df),
-        "date_range": meta["date_range"],
-        "source": source_name,
-        "status": "ok",
-        "error": None,
-    }
+    result = _db_save(df, index_code, level, data_type="index",
+                      source=source_name, start_date=start_date,
+                      name=index_name)
+    result["name"] = index_name
+    result["incremental"] = False
+    return result
 
 
 def get_cached_indices() -> list[dict]:
     """列出所有已缓存的指数数据。"""
-    cache_dir = _cache_dir()
-    if not os.path.exists(cache_dir):
-        return []
-
-    results = []
-    for f in os.listdir(cache_dir):
-        if not f.endswith("-index-meta.json"):
-            continue
-        try:
-            with open(os.path.join(cache_dir, f), encoding="utf-8") as fh:
-                meta = _json.load(fh)
-            meta["data_type"] = "index"
-            results.append(meta)
-        except Exception:
-            pass
-    return results
+    return _db_list_cached(data_type="index")
 
 
 def delete_index_cache(index_code: str, level: str | None = None) -> bool:
     """删除指定指数的缓存数据。"""
-    deleted = False
-    if level:
-        for path in [_index_cache_path(index_code, level), _index_meta_path(index_code, level)]:
-            if os.path.exists(path):
-                os.remove(path)
-                deleted = True
-    else:
-        cache_dir = _cache_dir()
-        if os.path.exists(cache_dir):
-            for f in os.listdir(cache_dir):
-                if f.startswith(f"{index_code}-index-") and (
-                    f.endswith(".csv") or f.endswith("-meta.json")
-                ):
-                    os.remove(os.path.join(cache_dir, f))
-                    deleted = True
-    return deleted
+    return _db_delete(index_code, level=level, data_type="index")
 
 
 def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
-    """Fetch OHLCV daily data, using cached/sync data first, then multi-source fetch.
+    """Fetch OHLCV daily data, using SQLite cache first, then multi-source fetch.
 
-    Mirrors stockstats_utils.load_ohlcv but uses A-stock data sources.
-    Returns DataFrame with columns: Date, Open, High, Low, Close, Volume
+    1. Check SQLite cache — if data exists and is fresh (≤1 day old), use it directly
+    2. If cache is stale, do an incremental update (only fetch new bars)
+    3. If no cache, full fetch from multi-source API
+    4. Always filter by curr_date to prevent look-ahead bias
     """
     code = _normalize_ticker(symbol)
-    cache_file = _daily_cache_path(code, "daily")
 
-    if os.path.exists(cache_file):
-        # If cached file exists, use it (may have more data from sync_stock_data)
-        # Use cached data if it exists at all — sync_stock_data provides full history
-        data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
-        data["Date"] = pd.to_datetime(data["Date"])
-        cutoff = pd.to_datetime(curr_date)
-        return data[data["Date"] <= cutoff]
+    # 优先从 SQLite 缓存加载
+    cached_latest = _db_latest_date(code, "daily", "stock")
 
-    # No cache — fetch from multi-source API (with mootdx final fallback)
-    df, _ = _fetch_kline(code, level="daily", start_date=None, datalen=10000)
+    if cached_latest:
+        cache_dt = pd.to_datetime(cached_latest)
+        now = datetime.now()
+        # 日线：缓存最新日期是今天或昨天，视为最新
+        is_fresh = (now.date() - cache_dt.date()).days <= 1
+
+        if not is_fresh:
+            # 缓存过期 → 增量更新
+            inc_start = (cache_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info("Incremental OHLCV update for %s: cached latest=%s, fetching from %s",
+                        code, cached_latest, inc_start)
+            try:
+                df_inc, src = _fetch_kline(code, level="daily", start_date=inc_start, datalen=10000)
+                if not df_inc.empty:
+                    _db_incremental(df_inc, code, "daily", data_type="stock", source=src)
+            except Exception as e:
+                logger.warning("Incremental update failed for %s: %s, using stale cache", code, e)
+
+        # 从 SQLite 加载全部数据
+        data = _db_load(code, "daily", data_type="stock")
+        if not data.empty:
+            data["Date"] = pd.to_datetime(data["Date"])
+            cutoff = pd.to_datetime(curr_date)
+            return data[data["Date"] <= cutoff]
+
+    # 无缓存 — 全量拉取并保存到 SQLite
+    df, source_name = _fetch_kline(code, level="daily", start_date=None, datalen=10000)
+
+    # mootdx TCP fallback
     if df.empty:
-        # Final mootdx TCP fallback
         try:
             client = _get_mootdx_client()
             raw = client.bars(symbol=code, category=4, offset=800)
@@ -1827,15 +1784,15 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
                 })
                 df = raw[["Date", "Open", "High", "Low", "Close", "Volume"]]
                 df["Date"] = pd.to_datetime(df["Date"])
+                source_name = "mootdx"
         except Exception as e:
             raise ValueError(f"No OHLCV data available for {code}: {e}")
 
     if df.empty:
         raise ValueError(f"No OHLCV data available for {code}")
 
-    # Cache to disk
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    df.to_csv(cache_file, index=False, encoding="utf-8")
+    # 保存到 SQLite
+    _db_save(df, code, "daily", data_type="stock", source=source_name)
 
     # Filter by curr_date to prevent look-ahead bias
     cutoff = pd.to_datetime(curr_date)
@@ -3959,18 +3916,12 @@ def get_chanlun_analysis(
         config = get_config()
         start_date = config.get("kline_start_date", "2024-01-01")
 
-    # 尝试从本地缓存加载
-    cache_file = _daily_cache_path(code, level)
+    # 优先从 SQLite 缓存加载
+    df = _db_load(code, level, data_type="stock",
+                  start_date=start_date, end_date=curr_date)
 
-    if os.path.exists(cache_file):
-        df = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
-        df["Date"] = pd.to_datetime(df["Date"])
-        cutoff = pd.to_datetime(curr_date)
-        df = df[df["Date"] <= cutoff]
-        if start_date:
-            df = df[df["Date"] >= pd.to_datetime(start_date)]
-    else:
-        # 没有缓存，尝试在线获取
+    # 没有缓存或缓存为空，尝试在线获取
+    if df.empty:
         try:
             df, _ = _fetch_kline(code, level=level, start_date=start_date, datalen=10000)
             if not df.empty:
