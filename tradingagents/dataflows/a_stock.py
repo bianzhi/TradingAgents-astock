@@ -1952,18 +1952,81 @@ def _get_financial_report_sina(
     return df.head(8)
 
 
+def _eastmoney_financial_report(
+    code: str, report_type: str, freq: str, curr_date: str = None,
+) -> pd.DataFrame:
+    """Fetch financial report via 东财 datacenter (backup for Sina).
+
+    report_type: 'income' | 'balance' | 'cashflow'
+    Returns DataFrame or empty.
+    """
+    _RPT_MAP = {
+        "income": "RPT_DMSK_FN_INCOME",
+        "balance": "RPT_DMSK_FN_BALANCE",
+        "cashflow": "RPT_DMSK_FN_CASHFLOW",
+    }
+    rpt_name = _RPT_MAP.get(report_type)
+    if not rpt_name:
+        return pd.DataFrame()
+
+    filter_str = f'(SECURITY_CODE="{code}")'
+    data = _eastmoney_datacenter(
+        rpt_name, filter_str=filter_str,
+        page_size=8, sort_columns="REPORT_DATE", sort_types="-1",
+    )
+    if not data:
+        return pd.DataFrame()
+
+    rows = []
+    for row in data:
+        report_date = str(row.get("REPORT_DATE", ""))[:10]
+        if not report_date:
+            continue
+        # freq filter: annual = only 1231 reports
+        if freq.lower() == "annual" and not report_date.endswith("12-31"):
+            continue
+        # curr_date filter
+        if curr_date:
+            try:
+                if report_date > curr_date:
+                    continue
+            except Exception:
+                pass
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if "REPORT_DATE" in df.columns:
+        df["REPORT_DATE"] = df["REPORT_DATE"].astype(str).str[:10]
+    return df
+
+
 def get_balance_sheet(
     ticker: Annotated[str, "A-stock code"],
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get balance sheet via Sina direct HTTP API."""
+    """Get balance sheet via Sina direct HTTP, with Eastmoney datacenter fallback."""
     code = _normalize_ticker(ticker)
 
     try:
+        # Primary: Sina
         df = _get_financial_report_sina(code, "资产负债表", freq, curr_date)
 
         if df.empty:
+            # Fallback: 东财 datacenter
+            logger.info("Sina balance sheet empty for %s, trying Eastmoney", code)
+            df = _eastmoney_financial_report(code, "balance", freq, curr_date)
+            if not df.empty:
+                csv_string = df.to_csv(index=False)
+                header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
+                header += "# Data source: eastmoney datacenter (Sina unavailable)\n"
+                header += (
+                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                )
+                return header + csv_string
             return f"No balance sheet data found for A-stock '{code}'"
 
         csv_string = df.to_csv(index=False)
@@ -1977,6 +2040,19 @@ def get_balance_sheet(
         return header + csv_string
 
     except Exception as e:
+        # Last fallback: Eastmoney
+        try:
+            df = _eastmoney_financial_report(code, "balance", freq, curr_date)
+            if not df.empty:
+                csv_string = df.to_csv(index=False)
+                header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
+                header += "# Data source: eastmoney datacenter (Sina error fallback)\n"
+                header += (
+                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                )
+                return header + csv_string
+        except Exception:
+            pass
         return f"Error retrieving balance sheet for {code}: {str(e)}"
 
 
@@ -1988,13 +2064,25 @@ def get_cashflow(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get cash flow statement via Sina direct HTTP API."""
+    """Get cash flow statement via Sina direct HTTP, with Eastmoney datacenter fallback."""
     code = _normalize_ticker(ticker)
 
     try:
+        # Primary: Sina
         df = _get_financial_report_sina(code, "现金流量表", freq, curr_date)
 
         if df.empty:
+            # Fallback: 东财 datacenter
+            logger.info("Sina cashflow empty for %s, trying Eastmoney", code)
+            df = _eastmoney_financial_report(code, "cashflow", freq, curr_date)
+            if not df.empty:
+                csv_string = df.to_csv(index=False)
+                header = f"# Cash Flow for {code} (A-stock, {freq})\n"
+                header += "# Data source: eastmoney datacenter (Sina unavailable)\n"
+                header += (
+                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                )
+                return header + csv_string
             return f"No cash flow data found for A-stock '{code}'"
 
         csv_string = df.to_csv(index=False)
@@ -2008,6 +2096,19 @@ def get_cashflow(
         return header + csv_string
 
     except Exception as e:
+        # Last fallback: Eastmoney
+        try:
+            df = _eastmoney_financial_report(code, "cashflow", freq, curr_date)
+            if not df.empty:
+                csv_string = df.to_csv(index=False)
+                header = f"# Cash Flow for {code} (A-stock, {freq})\n"
+                header += "# Data source: eastmoney datacenter (Sina error fallback)\n"
+                header += (
+                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                )
+                return header + csv_string
+        except Exception:
+            pass
         return f"Error retrieving cash flow for {code}: {str(e)}"
 
 
@@ -2019,13 +2120,25 @@ def get_income_statement(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get income statement via Sina direct HTTP API."""
+    """Get income statement via Sina direct HTTP, with Eastmoney datacenter fallback."""
     code = _normalize_ticker(ticker)
 
     try:
+        # Primary: Sina
         df = _get_financial_report_sina(code, "利润表", freq, curr_date)
 
         if df.empty:
+            # Fallback: 东财 datacenter
+            logger.info("Sina income empty for %s, trying Eastmoney", code)
+            df = _eastmoney_financial_report(code, "income", freq, curr_date)
+            if not df.empty:
+                csv_string = df.to_csv(index=False)
+                header = f"# Income Statement for {code} (A-stock, {freq})\n"
+                header += "# Data source: eastmoney datacenter (Sina unavailable)\n"
+                header += (
+                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                )
+                return header + csv_string
             return f"No income statement data found for A-stock '{code}'"
 
         csv_string = df.to_csv(index=False)
@@ -2039,6 +2152,19 @@ def get_income_statement(
         return header + csv_string
 
     except Exception as e:
+        # Last fallback: Eastmoney
+        try:
+            df = _eastmoney_financial_report(code, "income", freq, curr_date)
+            if not df.empty:
+                csv_string = df.to_csv(index=False)
+                header = f"# Income Statement for {code} (A-stock, {freq})\n"
+                header += "# Data source: eastmoney datacenter (Sina error fallback)\n"
+                header += (
+                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                )
+                return header + csv_string
+        except Exception:
+            pass
         return f"Error retrieving income statement for {code}: {str(e)}"
 
 
@@ -2304,54 +2430,113 @@ def get_global_news(
     )
 
 
-# ---- 9. get_insider_transactions ----
-
-
 def get_insider_transactions(
     ticker: Annotated[str, "A-stock code"],
 ) -> str:
-    """Get shareholder/insider activity via mootdx F10.
+    """Get shareholder/insider activity via mootdx F10 (primary) or Eastmoney datacenter (fallback).
 
     Note: A-stock insider transaction data differs from US markets.
-    Uses mootdx F10 shareholder research as the closest equivalent.
+    Primary: mootdx F10 shareholder research; Fallback: 东财 十大股东/十大流通股东.
     """
     code = _normalize_ticker(ticker)
+    lines = [
+        f"# Shareholder Research for {code} (A-stock)",
+        f"# Note: A-stock equivalent of insider transactions",
+        f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    got_data = False
 
+    # Source 1: mootdx F10 (primary)
     try:
         client = _get_mootdx_client()
         text = client.F10(symbol=code, name="股东研究")
 
-        if not text or not text.strip():
-            return f"No insider/shareholder data found for A-stock '{code}'"
+        if text and text.strip():
+            import re
 
-        header = f"# Shareholder Research for {code} (A-stock)\n"
-        header += "# Note: A-stock equivalent of insider transactions\n"
-        header += "# Data source: mootdx F10\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
+            sec4_hits = list(re.finditer(r"\r?\n【4\.股东变化】\r?\n", text))
+            if sec4_hits:
+                sec4_pos = sec4_hits[-1].start()
+                before_sec4 = text[:sec4_pos]
+                sec4_text = text[sec4_pos:]
+                cut_at = 2000
+                if len(sec4_text) > cut_at:
+                    sec4_text = (
+                        sec4_text[:cut_at]
+                        + "\n\n(... older shareholder history omitted, "
+                        + f"{len(text) - sec4_pos - cut_at} chars truncated ...)"
+                    )
+                text = before_sec4 + sec4_text
 
-        import re
-
-        sec4_hits = list(re.finditer(r"\r?\n【4\.股东变化】\r?\n", text))
-        if sec4_hits:
-            sec4_pos = sec4_hits[-1].start()
-            before_sec4 = text[:sec4_pos]
-            sec4_text = text[sec4_pos:]
-            cut_at = 2000
-            if len(sec4_text) > cut_at:
-                sec4_text = (
-                    sec4_text[:cut_at]
-                    + "\n\n(... older shareholder history omitted, "
-                    f"{len(text) - sec4_pos - cut_at} chars truncated ...)"
-                )
-            text = before_sec4 + sec4_text
-
-        return header + text
-
+            lines.append(text)
+            lines.append("\n# Source: mootdx F10")
+            got_data = True
     except Exception as e:
-        return f"Error retrieving insider/shareholder data for {code}: {str(e)}"
+        logger.warning("mootdx F10 failed for %s: %s", code, e)
 
+    # Source 2: 东财 datacenter 十大股东 + 十大流通股东 (fallback)
+    if not got_data:
+        try:
+            # 十大股东
+            holders = _eastmoney_datacenter(
+                "RPT_F10_EH_HOLDERS",
+                filter_str=f'(SECURITY_CODE="{code}")',
+                page_size=10, sort_columns="END_DATE", sort_types="-1",
+            )
+            if holders:
+                # Group by END_DATE
+                by_date: dict[str, list] = {}
+                for h in holders:
+                    ed = str(h.get("END_DATE", ""))[:10]
+                    by_date.setdefault(ed, []).append(h)
+
+                for ed in sorted(by_date.keys(), reverse=True)[:2]:
+                    lines.append(f"## 十大股东 ({ed})")
+                    lines.append("排名 | 股东名称 | 持股数 | 持股比例 | 变动")
+                    for h in by_date[ed]:
+                        rank = h.get("HOLDER_RANK", "")
+                        name = h.get("HOLDER_NAME", "")
+                        hold = h.get("HOLD_NUM", "")
+                        ratio = h.get("HOLD_NUM_RATIO", "")
+                        change = h.get("CHANGE_RATIO", "")
+                        lines.append(f"  {rank} | {name} | {hold} | {ratio}% | {change}%")
+                    lines.append("")
+
+            # 十大流通股东
+            free_holders = _eastmoney_datacenter(
+                "RPT_F10_EH_FREEHOLDERS",
+                filter_str=f'(SECURITY_CODE="{code}")',
+                page_size=10, sort_columns="END_DATE", sort_types="-1",
+            )
+            if free_holders:
+                by_date2: dict[str, list] = {}
+                for h in free_holders:
+                    ed = str(h.get("END_DATE", ""))[:10]
+                    by_date2.setdefault(ed, []).append(h)
+
+                for ed in sorted(by_date2.keys(), reverse=True)[:2]:
+                    lines.append(f"## 十大流通股东 ({ed})")
+                    lines.append("排名 | 股东名称 | 持股数 | 持股比例 | 变动")
+                    for h in by_date2[ed]:
+                        rank = h.get("HOLDER_RANK", "")
+                        name = h.get("HOLDER_NAME", "")
+                        hold = h.get("HOLD_NUM", "")
+                        ratio = h.get("FREE_HOLDNUM_RATIO", "")
+                        change = h.get("CHANGE_RATIO", "")
+                        lines.append(f"  {rank} | {name} | {hold} | {ratio}% | {change}%")
+                    lines.append("")
+
+            if holders or free_holders:
+                lines.append("# Source: 东财 datacenter (mootdx F10 不可用时的备选)")
+                got_data = True
+        except Exception as e:
+            logger.warning("东财股东数据查询失败 for %s: %s", code, e)
+
+    if not got_data:
+        return f"No insider/shareholder data found for A-stock '{code}'"
+
+    return "\n".join(lines)
 
 # ---- 10. get_profit_forecast ----
 
@@ -2360,91 +2545,137 @@ def get_profit_forecast(
     ticker: Annotated[str, "A-stock code"],
     curr_date: Annotated[str, "current date (unused, for interface compat)"] = None,
 ) -> str:
-    """Get consensus EPS forecasts with forward valuation (同花顺 direct HTTP)."""
+    """Get consensus EPS forecasts with forward valuation.
+
+    Primary: 同花顺 analyst consensus; Fallback: 东财 datacenter 利润表推算 EPS.
+    """
     code = _normalize_ticker(ticker)
 
+    lines = [
+        f"# Profit Forecast for {code} (A-stock)",
+        f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    got_data = False
+
+    # Source 1: 同花顺 analyst consensus (primary)
     try:
         df = _ths_eps_forecast(code)
 
-        if df is None or df.empty:
-            return f"No analyst coverage found for A-stock '{code}'"
+        if df is not None and not df.empty:
+            lines.append("## Consensus EPS Forecast (同花顺)")
+            eps_by_year = {}
+            for _, row in df.iterrows():
+                year = str(row.iloc[0]) if len(row) > 0 else ""
+                count_val = row.iloc[1] if len(row) > 1 else 0
+                mean_eps_val = row.iloc[3] if len(row) > 3 else 0
+                min_eps_val = row.iloc[2] if len(row) > 2 else "N/A"
+                max_eps_val = row.iloc[4] if len(row) > 4 else "N/A"
+                try:
+                    count = int(count_val)
+                except (ValueError, TypeError):
+                    count = 0
+                try:
+                    mean_eps = float(mean_eps_val)
+                except (ValueError, TypeError):
+                    mean_eps = 0
+                lines.append(
+                    f"FY{year}: EPS={mean_eps} (range {min_eps_val}~{max_eps_val}), "
+                    f"analysts={count}"
+                )
+                if count < 3:
+                    lines.append("  Warning: low coverage (<3 analysts)")
+                eps_by_year[year] = mean_eps
 
-        lines = [
-            f"# Consensus EPS Forecast for {code} (A-stock)",
-            f"# Source: 同花顺 analyst consensus (direct HTTP)",
-            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-        ]
-
-        eps_by_year = {}
-        for _, row in df.iterrows():
-            year = str(row.iloc[0]) if len(row) > 0 else ""
-            count_val = row.iloc[1] if len(row) > 1 else 0
-            mean_eps_val = row.iloc[3] if len(row) > 3 else 0
-            min_eps_val = row.iloc[2] if len(row) > 2 else "N/A"
-            max_eps_val = row.iloc[4] if len(row) > 4 else "N/A"
+            # Forward valuation from Tencent
             try:
-                count = int(count_val)
-            except (ValueError, TypeError):
-                count = 0
-            try:
-                mean_eps = float(mean_eps_val)
-            except (ValueError, TypeError):
-                mean_eps = 0
-            lines.append(
-                f"FY{year}: EPS={mean_eps} (range {min_eps_val}~{max_eps_val}), "
-                f"analysts={count}"
-            )
-            if count < 3:
-                lines.append("  Warning: low coverage (<3 analysts)")
-            eps_by_year[year] = mean_eps
+                tq = _tencent_quote([code])
+                if code in tq:
+                    price = tq[code]["price"]
+                    pe_ttm = tq[code]["pe_ttm"]
+                    lines.append(f"\nCurrent: price={price}, PE(TTM)={pe_ttm}")
 
-        # Forward valuation
-        try:
-            tq = _tencent_quote([code])
-            if code in tq:
-                price = tq[code]["price"]
-                pe_ttm = tq[code]["pe_ttm"]
-                lines.append(f"\nCurrent: price={price}, PE(TTM)={pe_ttm}")
-
-                years_sorted = sorted(eps_by_year.keys())
-                if years_sorted and eps_by_year.get(years_sorted[0], 0) > 0:
-                    eps_cur = eps_by_year[years_sorted[0]]
-                    fwd_pe = price / eps_cur
-                    lines.append(
-                        f"Forward PE (FY{years_sorted[0]}): {fwd_pe:.1f}x"
-                    )
-                    if (
-                        len(years_sorted) >= 2
-                        and eps_by_year.get(years_sorted[1], 0) > 0
-                    ):
-                        eps_next = eps_by_year[years_sorted[1]]
-                        cagr = eps_next / eps_cur - 1
-                        if cagr > 0:
-                            peg = fwd_pe / (cagr * 100)
-                            lines.append(
-                                f"PEG: {peg:.2f} (CAGR={cagr * 100:.0f}%)"
-                            )
-                            if fwd_pe > 30:
-                                digest = math.log(fwd_pe / 30) / math.log(
-                                    1 + cagr
-                                )
+                    years_sorted = sorted(eps_by_year.keys())
+                    if years_sorted and eps_by_year.get(years_sorted[0], 0) > 0:
+                        eps_cur = eps_by_year[years_sorted[0]]
+                        fwd_pe = price / eps_cur
+                        lines.append(f"Forward PE (FY{years_sorted[0]}): {fwd_pe:.1f}x")
+                        if (
+                            len(years_sorted) >= 2
+                            and eps_by_year.get(years_sorted[1], 0) > 0
+                        ):
+                            eps_next = eps_by_year[years_sorted[1]]
+                            cagr = eps_next / eps_cur - 1
+                            if cagr > 0:
+                                peg = fwd_pe / (cagr * 100)
+                                lines.append(f"PEG: {peg:.2f} (CAGR={cagr * 100:.0f}%)")
+                                if fwd_pe > 30:
+                                    digest = math.log(fwd_pe / 30) / math.log(1 + cagr)
+                                    lines.append(f"PE Digestion to 30x: {digest:.1f} years")
+                            else:
                                 lines.append(
-                                    f"PE Digestion to 30x: {digest:.1f} years"
+                                    f"EPS declining ({cagr * 100:.0f}%), PEG not applicable"
                                 )
-                        else:
-                            lines.append(
-                                f"EPS declining ({cagr * 100:.0f}%), "
-                                f"PEG not applicable"
-                            )
-        except Exception as e:
-            logger.warning("Forward PE calc failed for %s: %s", code, e)
+            except Exception as e:
+                logger.warning("Forward PE calc failed for %s: %s", code, e)
 
-        return "\n".join(lines)
-
+            lines.append("\n# Source: 同花顺 analyst consensus")
+            got_data = True
     except Exception as e:
-        return f"Error retrieving profit forecast for {code}: {str(e)}"
+        logger.warning("同花顺 EPS forecast failed for %s: %s", code, e)
 
+    # Source 2: 东财 datacenter 利润表推算 EPS (fallback)
+    if not got_data:
+        try:
+            data = _eastmoney_datacenter(
+                "RPT_DMSK_FN_INCOME",
+                filter_str=f'(SECURITY_CODE="{code}")',
+                page_size=8, sort_columns="REPORT_DATE", sort_types="-1",
+            )
+            if data:
+                lines.append("## EPS from Financial Reports (东财)")
+                eps_by_year = {}
+                # Try to get total shares for EPS calculation
+                total_shares = 0
+                try:
+                    tq = _tencent_quote([code])
+                    if code in tq:
+                        mcap = tq[code].get("mcap_yi", 0) * 1e8
+                        price = tq[code].get("price", 0)
+                        if price > 0:
+                            total_shares = mcap / price
+                except Exception:
+                    pass
+
+                for row in data:
+                    report_date = str(row.get("REPORT_DATE", ""))[:10]
+                    net_profit = row.get("PARENT_NETPROFIT")
+                    revenue = row.get("TOTAL_OPERATE_INCOME")
+                    net_ratio = row.get("PARENT_NETPROFIT_RATIO")
+                    if net_profit is None:
+                        continue
+                    # Filter by freq
+                    if curr_date and report_date > curr_date:
+                        continue
+                    profit_yi = float(net_profit) / 1e8
+                    revenue_yi = float(revenue) / 1e8 if revenue else 0
+                    eps_est = float(net_profit) / total_shares if total_shares > 0 else 0
+                    lines.append(
+                        f"{report_date}: 净利润={profit_yi:.2f}亿 "
+                        f"营收={revenue_yi:.2f}亿 YoY={net_ratio or 'N/A'}% "
+                        f"EPS≈{eps_est:.2f}"
+                    )
+                    eps_by_year[report_date[:4]] = eps_est
+
+                lines.append("\n# Source: 东财 datacenter (同花顺不可用时的备选，EPS为估算)")
+                got_data = True
+        except Exception as e:
+            logger.warning("东财利润表查询失败 for %s: %s", code, e)
+
+    if not got_data:
+        return f"No profit forecast data found for A-stock '{code}'"
+
+    return "\n".join(lines)
 
 # ---- 11. get_hot_stocks ----
 
@@ -2452,16 +2683,22 @@ def get_profit_forecast(
 def get_hot_stocks(
     curr_date: Annotated[str, "Date YYYY-MM-DD, empty string for today"] = "",
 ) -> str:
-    """Get strong stocks with topic attribution from 同花顺 editorial team.
+    """Get strong/limit-up stocks with topic attribution.
 
-    Returns stocks that hit limit-up with human-curated reason tags
-    explaining WHY they surged (e.g. '算力租赁+AI政务').
+    Primary: 同花顺 editorial (human-curated reason tags);
+    Fallback: 东财 push2 clist (涨幅排名).
     """
-    import requests
-
     if not curr_date or curr_date.strip() == "":
         curr_date = datetime.now().strftime("%Y-%m-%d")
 
+    lines = [
+        f"# Hot Stocks ({curr_date})",
+        f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    got_data = False
+
+    # Source 1: 同花顺 editorial (primary — human-curated reason tags)
     try:
         url = (
             f"http://zx.10jqka.com.cn/event/api/getharden/"
@@ -2473,60 +2710,96 @@ def get_hot_stocks(
                 "Chrome/117.0.0.0 Safari/537.36"
             )
         }
-        r = requests.get(url, headers=headers, timeout=10)
+        r = _requests.get(url, headers=headers, timeout=10, proxies=_NO_PROXY)
         data = r.json()
 
         if data.get("errocode", 0) != 0:
-            return f"同花顺 API error: {data.get('errormsg', 'unknown')}"
+            raise ValueError(f"同花顺 API error: {data.get('errormsg', 'unknown')}")
 
         rows = data.get("data") or []
-        if not rows:
-            return (
-                f"No hot stocks data for {curr_date} "
-                f"(may be non-trading day or data not yet available)"
-            )
+        if rows:
+            lines.append(f"## 涨停板 ({len(rows)} stocks, 同花顺)")
+            lines.append("代码 名称 | 涨幅 | 换手 | 原因")
 
-        lines = [
-            f"# Hot Stocks with Topic Attribution ({curr_date})",
-            f"# Source: 同花顺 editorial (human-curated reason tags)",
-            f"# Total: {len(rows)} stocks",
-            "",
-        ]
+            from collections import Counter
 
-        from collections import Counter
+            all_tags: list[str] = []
+            for row in rows:
+                stk_code = row.get("code", "")
+                name = row.get("name", "")
+                reason = row.get("reason", "")
+                zhangfu = row.get("zhangfu", "")
+                huanshou = row.get("huanshou", "")
+                chengjiaoe = row.get("chengjiaoe", "")
+                dde = row.get("ddejingliang", "")
 
-        all_tags: list[str] = []
+                lines.append(
+                    f"  {stk_code} {name}: +{zhangfu}% "
+                    f"换手{huanshou}% 成交额{chengjiaoe} "
+                    f"大单净量{dde} | {reason}"
+                )
 
-        for row in rows:
-            code = row.get("code", "")
-            name = row.get("name", "")
-            reason = row.get("reason", "")
-            zhangfu = row.get("zhangfu", "")
-            huanshou = row.get("huanshou", "")
-            chengjiaoe = row.get("chengjiaoe", "")
-            dde = row.get("ddejingliang", "")
+                if reason:
+                    tags = [t.strip() for t in str(reason).split("+") if t.strip()]
+                    all_tags.extend(tags)
 
-            lines.append(
-                f"{code} {name}: +{zhangfu}% "
-                f"换手{huanshou}% 成交额{chengjiaoe} "
-                f"大单净量{dde} | {reason}"
-            )
+            if all_tags:
+                cnt = Counter(all_tags)
+                lines.append(f"\n## Theme Frequency (top 15)")
+                for tag, n in cnt.most_common(15):
+                    lines.append(f"  {tag}: {n} stocks")
 
-            if reason:
-                tags = [t.strip() for t in str(reason).split("+") if t.strip()]
-                all_tags.extend(tags)
-
-        if all_tags:
-            cnt = Counter(all_tags)
-            lines.append(f"\n## Theme Frequency (top 15)")
-            for tag, n in cnt.most_common(15):
-                lines.append(f"  {tag}: {n} stocks")
-
-        return "\n".join(lines)
-
+            lines.append("\n# Source: 同花顺 editorial")
+            got_data = True
     except Exception as e:
-        return f"Error fetching hot stocks for {curr_date}: {str(e)}"
+        logger.warning("同花顺涨停板 failed: %s", e)
 
+    # Source 2: 东财 push2 clist — 涨幅排名 (fallback)
+    if not got_data:
+        try:
+            url = "http://push2.eastmoney.com/api/qt/clist/get"
+            params = {
+                "pn": "1", "pz": "30", "po": "1", "np": "1",
+                "fltt": "2", "invt": "2",
+                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
+                "fields": "f2,f3,f4,f5,f6,f7,f8,f12,f14,f15",
+            }
+            r = _requests.get(url, params=params, headers={"User-Agent": _UA},
+                              timeout=10, proxies=_NO_PROXY)
+            d = r.json()
+            items = d.get("data", {}).get("diff", [])
+
+            if items:
+                limit_up_stocks = [it for it in items
+                                   if isinstance(it.get("f3"), (int, float)) and it["f3"] >= 9.5]
+                display = limit_up_stocks[:30] if limit_up_stocks else items[:20]
+                lines.append(
+                    f"## 涨幅排名 ({len(limit_up_stocks)} 涨停, 东财)"
+                )
+                lines.append("代码 名称 | 涨幅 | 换手 | 成交额(亿)")
+                for it in display:
+                    code_em = it.get("f12", "")
+                    name_em = it.get("f14", "")
+                    pct = it.get("f3", "")
+                    turnover = it.get("f8", "")
+                    amount = it.get("f6", 0)
+                    amount_yi = float(amount) / 1e8 if amount else 0
+                    lines.append(
+                        f"  {code_em} {name_em}: +{pct}% "
+                        f"换手{turnover}% 成交额{amount_yi:.1f}亿"
+                    )
+                lines.append("\n# Source: 东财 push2 (同花顺不可用时的备选)")
+                got_data = True
+        except Exception as e:
+            logger.warning("东财涨幅排名 failed: %s", e)
+
+    if not got_data:
+        return (
+            f"No hot stocks data for {curr_date} "
+            f"(may be non-trading day or all sources failed)"
+        )
+
+    return "\n".join(lines)
 
 # ---- 12. get_northbound_flow ----
 
@@ -2584,26 +2857,14 @@ def get_northbound_flow(
         bool, "Include historical daily data (last 20 trading days)"
     ] = False,
 ) -> str:
-    """Get northbound capital flow (沪深股通) from 同花顺 hsgtApi.
+    """Get northbound capital flow (沪深股通).
 
+    Primary: 同花顺 hsgtApi; Fallback: 东财 push2 kamt.
     Realtime: minute-level cumulative net buying for HGT(沪股通) + SGT(深股通).
-    History: self-cached daily close snapshots (upstream APIs stopped updating
-    northbound history since 2024-08).
+    History: self-cached daily close snapshots.
     """
-    import requests
-
-    hsgt_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "Chrome/117.0.0.0 Safari/537.36"
-        ),
-        "Host": "data.hexin.cn",
-        "Referer": "https://data.hexin.cn/",
-    }
-
     lines = [
         f"# Northbound Capital Flow ({curr_date})",
-        "# Source: 同花顺 hsgtApi (沪深股通) + local cache",
         "",
     ]
 
@@ -2611,9 +2872,19 @@ def get_northbound_flow(
     sgt_close = 0.0
     got_realtime = False
 
+    # Source 1: 同花顺 hsgtApi (primary)
     try:
+        hsgt_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "Chrome/117.0.0.0 Safari/537.36"
+            ),
+            "Host": "data.hexin.cn",
+            "Referer": "https://data.hexin.cn/",
+        }
         url_rt = "https://data.hexin.cn/market/hsgtApi/method/dayChart/"
-        r = requests.get(url_rt, headers=hsgt_headers, timeout=10)
+        r = _requests.get(url_rt, headers=hsgt_headers, timeout=10,
+                          proxies=_NO_PROXY)
         d = r.json()
 
         times = d.get("time", [])
@@ -2621,7 +2892,7 @@ def get_northbound_flow(
         sgt = d.get("sgt", [])
 
         if times:
-            lines.append("## Realtime (cumulative net buying, 亿元)")
+            lines.append("## Realtime (cumulative net buying, 亿元, 同花顺)")
             n = len(times)
             start_idx = max(0, n - 10)
             for i in range(start_idx, n):
@@ -2644,40 +2915,96 @@ def get_northbound_flow(
                 lines.append("Signal: Net northbound OUTFLOW (bearish)")
             got_realtime = True
         else:
-            lines.append("No realtime data (non-trading hours or holiday)")
+            lines.append("No realtime data from 同花顺 (non-trading hours or holiday)")
 
         if got_realtime:
             today_str = datetime.now().strftime("%Y-%m-%d")
             _save_northbound_snapshot(today_str, hgt_close, sgt_close)
 
-        if include_history:
-            history = _load_northbound_history(20)
-            if history:
-                lines.append("\n## Historical Daily Close (local cache, 亿元)")
-                lines.append("Date       | HGT(沪股通) | SGT(深股通) | Total")
-                for date, h, s in history:
-                    lines.append(f"  {date}: HGT={h:.2f} SGT={s:.2f} Total={h + s:.2f}")
-                avg_total = sum(h + s for _, h, s in history) / len(history)
-                lines.append(
-                    f"\n{len(history)}-day avg net flow: {avg_total:.2f}亿"
-                )
-                if got_realtime:
-                    today_total = hgt_close + sgt_close
-                    diff = today_total - avg_total
-                    lines.append(
-                        f"Today vs avg: {'+' if diff >= 0 else ''}{diff:.2f}亿 "
-                        f"({'above' if diff >= 0 else 'below'} average)"
-                    )
-            else:
-                lines.append(
-                    "\n## Historical Daily: No cached data yet. "
-                    "History accumulates automatically with each call."
-                )
-
-        return "\n".join(lines)
+        lines.append("\n# Source: 同花顺 hsgtApi")
 
     except Exception as e:
-        return f"Error fetching northbound flow: {str(e)}"
+        logger.warning("同花顺北向资金 failed: %s", e)
+
+    # Source 2: 东财 push2 kamt (fallback)
+    if not got_realtime:
+        try:
+            url_kamt = "http://push2his.eastmoney.com/api/qt/kamt.rtmin/get"
+            params_kamt = {
+                "fields1": "f1,f2,f3,f4",
+                "fields2": "f51,f52,f53,f54,f55,f56",
+            }
+            r2 = _requests.get(url_kamt, params=params_kamt,
+                               headers={"User-Agent": _UA}, timeout=10,
+                               proxies=_NO_PROXY)
+            d2 = r2.json()
+            s2n = d2.get("data", {}).get("s2n", [])
+
+            if s2n:
+                lines.append("## Realtime (cumulative net buying, 亿元, 东财)")
+                for line in s2n[-10:]:
+                    parts = line.split(",")
+                    if len(parts) >= 3:
+                        # parts: time, sgt_net, hgt_net, ...
+                        lines.append(
+                            f"  {parts[0]}: HGT={parts[2]} SGT={parts[1]}"
+                        )
+                # Last values
+                last = s2n[-1].split(",")
+                if len(last) >= 3:
+                    try:
+                        hgt_close = float(last[2])
+                        sgt_close = float(last[1])
+                        total = hgt_close + sgt_close
+                        lines.append(
+                            f"\nClose: HGT(沪股通)={hgt_close:.2f}亿 "
+                            f"SGT(深股通)={sgt_close:.2f}亿 "
+                            f"Total={total:.2f}亿"
+                        )
+                        if total > 0:
+                            lines.append("Signal: Net northbound INFLOW (bullish)")
+                        elif total < 0:
+                            lines.append("Signal: Net northbound OUTFLOW (bearish)")
+                    except (ValueError, IndexError):
+                        pass
+                got_realtime = True
+                lines.append("\n# Source: 东财 push2 (同花顺不可用时的备选)")
+
+                if got_realtime:
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    _save_northbound_snapshot(today_str, hgt_close, sgt_close)
+        except Exception as e:
+            logger.warning("东财北向资金 failed: %s", e)
+
+    # Historical daily close (local cache)
+    if include_history:
+        history = _load_northbound_history(20)
+        if history:
+            lines.append("\n## Historical Daily Close (local cache, 亿元)")
+            lines.append("Date       | HGT(沪股通) | SGT(深股通) | Total")
+            for date, h, s in history:
+                lines.append(f"  {date}: HGT={h:.2f} SGT={s:.2f} Total={h + s:.2f}")
+            avg_total = sum(h + s for _, h, s in history) / len(history)
+            lines.append(
+                f"\n{len(history)}-day avg net flow: {avg_total:.2f}亿"
+            )
+            if got_realtime:
+                today_total = hgt_close + sgt_close
+                diff = today_total - avg_total
+                lines.append(
+                    f"Today vs avg: {'+' if diff >= 0 else ''}{diff:.2f}亿 "
+                    f"({'above' if diff >= 0 else 'below'} average)"
+                )
+        else:
+            lines.append(
+                "\n## Historical Daily: No cached data yet. "
+                "History accumulates automatically with each call."
+            )
+
+    if not lines or (len(lines) <= 2 and not got_realtime):
+        return f"Error fetching northbound flow: all sources failed"
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2802,7 +3129,7 @@ def get_fund_flow(
         bool, "Include historical daily fund flow (last 20 days)"
     ] = True,
 ) -> str:
-    """Get individual stock fund flow from 东财 push2.
+    """Get individual stock fund flow from 东财 push2 (primary) or 腾讯 (fallback).
 
     Realtime: minute-level main/large/medium/small/super order net inflow.
     History: daily net inflow for 20 trading days (push2his).
@@ -2814,13 +3141,14 @@ def get_fund_flow(
     secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
     lines = [
         f"# Fund Flow for {code} (A-stock)",
-        f"# Source: 东财 push2 (Eastmoney)",
         f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
     ]
+    got_data = False
 
     _push2_headers = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
 
+    # Source 1: 东财 push2 (primary)
     try:
         # Realtime minute-level fund flow
         url_rt = "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
@@ -2863,10 +3191,15 @@ def get_fund_flow(
                     lines.append(
                         "Signal: Net main force OUTFLOW (bearish)"
                     )
+            got_data = True
         else:
-            lines.append(
-                "No realtime fund flow (non-trading hours or holiday)"
-            )
+            # 非交易时间或有数据但 klines 为空
+            d_check = d.get("data", {})
+            if d_check and d_check.get("code") is not None:
+                lines.append(
+                    "No realtime fund flow (non-trading hours or holiday)"
+                )
+                got_data = True  # push2 可达只是非交易时间
 
         # Historical daily fund flow (push2his)
         if include_history:
@@ -2907,11 +3240,37 @@ def get_fund_flow(
                             f"| super={float(parts[5])/1e4:.0f}"
                         )
 
-        return "\n".join(lines)
+        if got_data or klines:
+            lines.append("\n# Source: 东财 push2")
+            return "\n".join(lines)
 
     except Exception as e:
-        return f"Error fetching fund flow for {code}: {str(e)}"
+        logger.warning("东财 push2 fund flow failed for %s: %s", code, e)
 
+    # Source 2: 腾讯 — 利用实时行情提供换手率/成交量/涨跌幅作为资金概览 (fallback)
+    if not got_data:
+        try:
+            tq = _tencent_quote([code])
+            if code in tq:
+                q = tq[code]
+                lines.append("## Fund Flow Overview (腾讯，东财不可用时的备选)")
+                lines.append(f"  Name: {q['name']}")
+                lines.append(f"  Price: {q['price']}")
+                lines.append(f"  Change: {q['change_pct']}%")
+                lines.append(f"  Turnover Rate: {q['turnover_pct']}%")
+                lines.append(f"  Market Cap: {q['mcap_yi']}亿")
+                lines.append(f"  Float Market Cap: {q['float_mcap_yi']}亿")
+                lines.append(f"  PE (TTM): {q['pe_ttm']}")
+                lines.append(f"  PB: {q['pb']}")
+                lines.append("\n# Source: 腾讯实时行情 (东财push2不可用时的备选)")
+                got_data = True
+        except Exception as e:
+            logger.warning("腾讯 fund flow fallback failed for %s: %s", code, e)
+
+    if not got_data:
+        return f"Error fetching fund flow for {code}: all sources failed"
+
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # 15. Dragon Tiger Board (龙虎榜)
@@ -2923,6 +3282,9 @@ def get_dragon_tiger_board(
     look_back_days: int = 30,
 ) -> str:
     """Get dragon-tiger board (龙虎榜) appearances and seat details.
+
+    Primary: 东财 datacenter (RPT_DAILYBILLBOARD_DETAILSNEW);
+    Fallback: mootdx F10 龙虎榜.
 
     Args:
         ticker: 6-digit A-share code, e.g. '000858'
@@ -2939,7 +3301,12 @@ def get_dragon_tiger_board(
     start_date_str = start_dt.strftime("%Y-%m-%d")
     lines = [f"# 龙虎榜数据 | {code} | {trade_date} (近{look_back_days}日)"]
 
-    # 1. 上榜记录 — eastmoney datacenter direct HTTP
+    buy_data = None
+    sell_data = None
+    data = None
+    got_data = False
+
+    # Source 1: 上榜记录 — eastmoney datacenter direct HTTP (primary)
     try:
         data = _eastmoney_datacenter(
             "RPT_DAILYBILLBOARD_DETAILSNEW",
@@ -3017,7 +3384,7 @@ def get_dragon_tiger_board(
     except Exception:
         pass
 
-    # 3. 机构动向 — 从买卖席位明细筛选机构专用席位 (OPERATEDEPT_CODE="0")
+    # 3. 机构动向 — 从买卖席位明细筛选机构专用席位
     try:
         inst_buy = 0.0
         inst_sell = 0.0
@@ -3119,8 +3486,13 @@ def get_lockup_expiry(
     except Exception as e:
         lines.append(f"解禁日历查询失败: {e}")
 
+
     return "\n".join(lines)
 
+
+# ---------------------------------------------------------------------------
+# 17. Industry Comparison (行业横向对比)
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # 17. Industry Comparison (行业横向对比)
