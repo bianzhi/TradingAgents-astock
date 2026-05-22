@@ -679,6 +679,215 @@ def _tushare_kline(code: str, level: str = "daily",
     return df
 
 
+def _ths_kline_5min(code: str, start_date: str = None,
+                    datalen: int = 10000) -> pd.DataFrame:
+    """从同花顺获取5分钟K线数据（用于聚合为更大级别K线）。
+
+    同花顺 d.10jqka.com.cn 接口。
+    每条格式: timestamp,open,high,low,close,volume,amount,change%,,,flag
+    timestamp 格式: YYYYMMDDHHmm
+
+    注意: 同花顺 period 代码不是时间级别，而是数据类型代码:
+      01 = 日线, 30 = 5分钟线, 60 = 1分钟线
+
+    部分股票5分钟K线(period=30)缺数据时，降级到1分钟K线(period=60)
+    再聚合为5分钟K线。
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
+    """
+    headers = {
+        "User-Agent": _UA,
+        "Referer": "https://d.10jqka.com.cn/",
+    }
+
+    # 确定需要哪些年份的数据
+    import datetime as _dt
+    start_year = (pd.to_datetime(start_date) if start_date else _dt.datetime(2024, 1, 1)).year
+    end_year = _dt.datetime.now().year
+
+    def _fetch_ths_year(year: int, period: str) -> pd.DataFrame:
+        """获取指定年份的K线数据。"""
+        url = f"https://d.10jqka.com.cn/v6/line/hs_{code}/{period}/{year}.js"
+        try:
+            r = _requests.get(url, headers=headers, timeout=15, proxies=_NO_PROXY)
+            r.raise_for_status()
+        except Exception:
+            # SSL fallback
+            try:
+                r = _requests.get(url, headers=headers, timeout=15,
+                                  verify=False, proxies=_NO_PROXY)
+                r.raise_for_status()
+            except Exception:
+                return pd.DataFrame()
+
+        text = r.text.strip()
+        # JSONP: quotebridge_v6_line_hs_{code}_{period}_{year}({...})
+        eq_pos = text.find("(")
+        if eq_pos < 0:
+            return pd.DataFrame()
+        json_str = text[eq_pos + 1:].rstrip(")")
+        try:
+            d = _json.loads(json_str)
+        except (ValueError, _json.JSONDecodeError):
+            return pd.DataFrame()
+
+        data_str = d.get("data", "")
+        if not data_str:
+            return pd.DataFrame()
+
+        # 解析: timestamp,open,high,low,close,volume,amount,change,...;...
+        rows = []
+        for segment in data_str.split(";"):
+            segment = segment.strip()
+            if not segment:
+                continue
+            parts = segment.split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                ts = parts[0]
+                # YYYYMMDDHHmm → datetime
+                dt = pd.to_datetime(ts, format="%Y%m%d%H%M")
+                rows.append({
+                    "Date": dt,
+                    "Open": float(parts[1]),
+                    "High": float(parts[2]),
+                    "Low": float(parts[3]),
+                    "Close": float(parts[4]),
+                    "Volume": int(float(parts[5])),
+                })
+            except (ValueError, IndexError):
+                continue
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    # 先尝试5分钟K线 (period=30)
+    all_rows_df = pd.DataFrame()
+    for year in range(start_year, end_year + 1):
+        df_year = _fetch_ths_year(year, "30")
+        if not df_year.empty:
+            all_rows_df = pd.concat([all_rows_df, df_year], ignore_index=True)
+        # 同花顺限流：年份间加延时
+        _time.sleep(0.3)
+
+    # 如果5分钟数据为空，降级到1分钟K线 (period=60)，再聚合为5分钟
+    if all_rows_df.empty:
+        logger.info("THS 5min kline empty for %s, falling back to 1min→5min", code)
+        for year in range(start_year, end_year + 1):
+            df_year = _fetch_ths_year(year, "60")
+            if not df_year.empty:
+                all_rows_df = pd.concat([all_rows_df, df_year], ignore_index=True)
+            _time.sleep(0.3)
+
+        if not all_rows_df.empty:
+            all_rows_df = all_rows_df.sort_values("Date").reset_index(drop=True)
+            # 1分钟→5分钟聚合
+            all_rows_df = _resample_minute_kline(all_rows_df, "5min")
+
+    if all_rows_df.empty:
+        return pd.DataFrame()
+
+    all_rows_df = all_rows_df.sort_values("Date").reset_index(drop=True)
+
+    if start_date:
+        all_rows_df = all_rows_df[all_rows_df["Date"] >= pd.to_datetime(start_date)]
+
+    # 限制数据量
+    if len(all_rows_df) > datalen:
+        all_rows_df = all_rows_df.iloc[-datalen:]
+
+    return all_rows_df
+
+
+def _resample_minute_kline(df_5min: pd.DataFrame,
+                           target_level: str) -> pd.DataFrame:
+    """将5分钟K线聚合为更大时间级别的K线。
+
+    聚合规则:
+        5min: 每1根1min → 1根5min (1min→5min转换)
+        15min: 每3根5min → 1根15min
+        30min: 每6根5min → 1根30min
+        60min: 每12根5min → 1根60min
+
+    A 股交易时段: 9:30-11:30, 13:00-15:00
+    聚合边界必须对齐交易时段:
+        30min: [9:30-10:00] [10:00-10:30] [10:30-11:00] [11:00-11:30]
+               [13:00-13:30] [13:30-14:00] [14:00-14:30] [14:30-15:00]
+
+    Args:
+        df_5min: 5分钟(或1分钟)K线 DataFrame
+        target_level: 目标级别 (5min/15min/30min/60min)
+
+    Returns:
+        聚合后的 DataFrame
+    """
+
+    _LEVEL_MINUTES = {"5min": 5, "15min": 15, "30min": 30, "60min": 60}
+    target_min = _LEVEL_MINUTES.get(target_level)
+    if target_min is None:
+        return pd.DataFrame()
+
+    # 自动检测输入K线的基础粒度（5min或1min）
+    if len(df_5min) >= 2:
+        delta = (df_5min["Date"].iloc[1] - df_5min["Date"].iloc[0]).total_seconds()
+        base_minutes = max(int(delta / 60), 1)
+    else:
+        base_minutes = 5  # 默认5min
+
+    ratio = max(target_min // base_minutes, 1)  # e.g. 30/5=6, 30/1=30, 5/1=5
+
+    # 为每条5min K线计算所属的30min区间起始时间
+    # A 股交易时段对齐
+    def _align_period(dt, period_minutes):
+        """将 datetime 对齐到最近的 K 线周期起始时间。"""
+        h, m = dt.hour, dt.minute
+        # 午休分隔：13:00 开始新半天
+        if h >= 13:
+            # 下午盘: 从 13:00 开始算
+            afternoon_min = (h - 13) * 60 + m
+            period_start_min = (afternoon_min // period_minutes) * period_minutes
+            ph = 13 + period_start_min // 60
+            pm = period_start_min % 60
+        else:
+            # 上午盘: 从 9:30 开始算
+            morning_min = (h - 9) * 60 + m - 30
+            if morning_min < 0:
+                morning_min = 0
+            period_start_min = (morning_min // period_minutes) * period_minutes
+            ph = 9 + (period_start_min + 30) // 60
+            pm = (period_start_min + 30) % 60
+        return dt.replace(hour=ph, minute=pm, second=0, microsecond=0)
+
+    # 按日期 + 对齐后的区间分组
+    df_5min = df_5min.copy()
+    df_5min["_period"] = df_5min["Date"].apply(
+        lambda dt: _align_period(dt, target_min)
+    )
+
+    # 聚合
+    agg_df = df_5min.groupby("_period").agg(
+        Date=("Date", "first"),      # 区间内第一根的时间
+        Open=("Open", "first"),
+        High=("High", "max"),
+        Low=("Low", "min"),
+        Close=("Close", "last"),
+        Volume=("Volume", "sum"),
+    ).reset_index(drop=True)
+
+    # 只保留完整周期（K线数量等于 ratio）
+    # 放宽条件：至少有 ratio-2 根才认为是合理区间（尾盘可能不完整）
+    period_counts = df_5min.groupby("_period").size()
+    valid_periods = period_counts[period_counts >= max(ratio - 2, 2)].index
+    agg_df = agg_df[agg_df["Date"].isin(
+        df_5min[df_5min["_period"].isin(valid_periods)]["Date"]
+    )].reset_index(drop=True)
+
+    return agg_df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+
+
+
+
 def _fetch_kline(code: str, level: str = "daily",
                  start_date: str = None, datalen: int = 10000,
                  sources: list[str] | None = None) -> tuple[pd.DataFrame, str]:
@@ -728,6 +937,19 @@ def _fetch_kline(code: str, level: str = "daily",
             # 请求间加延时，避免连续请求触发限流
             _time.sleep(_KLINE_REQUEST_INTERVAL)
             continue
+
+    # 分钟级K线: 尝试从同花顺5分钟K线聚合（东财/新浪/腾讯均失败时）
+    if level in ("5min", "15min", "30min", "60min"):
+        try:
+            df_5min = _ths_kline_5min(code, start_date=start_date, datalen=datalen * 6)
+            if df_5min is not None and not df_5min.empty:
+                if level == "5min":
+                    return df_5min, "ths5min"
+                df_resampled = _resample_minute_kline(df_5min, level)
+                if df_resampled is not None and not df_resampled.empty:
+                    return df_resampled, f"ths5min(→{level})"
+        except Exception as e:
+            errors.append(f"ths5min: {e}")
 
     # 所有源都失败了 — 日线 fallback from mootdx (TCP)
     if level in ("daily", "weekly", "monthly"):
