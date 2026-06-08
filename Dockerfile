@@ -55,11 +55,11 @@ gatherUsageStats = false\n\
 magicEnabled = false\n' > /home/appuser/.streamlit/config.toml && \
     chown -R appuser:appuser /home/appuser/.streamlit
 
-ENV STREAMLIT_SERVER_PORT=8501 \
+ENV STREAMLIT_SERVER_PORT=8911 \
     HOME=/home/appuser
 
-EXPOSE 8501
+EXPOSE 8911
 
 # Run entrypoint as root to fix volume permissions, then drop to appuser
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["python", "-m", "streamlit", "run", "web/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["python", "-m", "streamlit", "run", "web/app.py", "--server.port=8911", "--server.address=0.0.0.0"]

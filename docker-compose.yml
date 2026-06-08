@@ -9,7 +9,7 @@ services:
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
     ports:
-      - "8501:8501"
+      - "8911:8911"
     restart: unless-stopped
 
   # ── Optional: CLI mode (no web UI) ──────────────────────────────────────────
@@ -43,7 +43,7 @@ services:
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
     ports:
-      - "8501:8501"
+      - "8911:8911"
     depends_on:
       - ollama
     tty: true
