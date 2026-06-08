@@ -12,6 +12,7 @@ from .types import (
     Direction,
     Pivot,
     Segment,
+    Stroke,
     Trend,
     TrendType,
 )
@@ -20,7 +21,92 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 中枢识别
+# 笔中枢识别（用笔直接构造中枢，而非线段）
+# ---------------------------------------------------------------------------
+
+def find_stroke_pivots(
+    strokes: list[Stroke],
+    min_strokes: int = 3,
+) -> list[Pivot]:
+    """识别笔中枢：取连续 N 根笔的价格重叠区间构成中枢。
+
+    笔中枢定义（缠论初学者常用做法）：
+    至少3根连续笔的高低点有重叠，即：
+    - ZG = max(各笔的低点)  — 中枢上沿
+    - ZD = min(各笔的高点)  — 中枢下沿
+    - 若 ZG < ZD 则无重叠，前移1笔继续
+
+    Args:
+        strokes: 笔序列
+        min_strokes: 构成中枢所需最少笔数，默认3
+
+    Returns:
+        笔中枢序列。
+    """
+    if len(strokes) < min_strokes:
+        return []
+
+    pivots: list[Pivot] = []
+    i = 0
+
+    while i <= len(strokes) - min_strokes:
+        window = strokes[i:i + min_strokes]
+
+        # 每笔的价格区间
+        stroke_ranges = []
+        for s in window:
+            low = min(s.start_value, s.end_value)
+            high = max(s.start_value, s.end_value)
+            stroke_ranges.append((low, high))
+
+        zg = max(r[0] for r in stroke_ranges)  # max(lows)
+        zd = min(r[1] for r in stroke_ranges)  # min(highs)
+        gg = max(r[1] for r in stroke_ranges)  # max(highs)
+        dd = min(r[0] for r in stroke_ranges)  # min(lows)
+
+        if zg >= zd:
+            # 无重叠，前移1笔
+            i += 1
+            continue
+
+        # 有重叠 → 构成中枢
+        pivot_end_idx = i + min_strokes - 1
+        j = pivot_end_idx + 1
+
+        # 检查后续笔是否延伸
+        while j < len(strokes):
+            s = strokes[j]
+            s_low = min(s.start_value, s.end_value)
+            s_high = max(s.start_value, s.end_value)
+            if s_low <= zg and s_high >= zd:
+                # 延伸中枢
+                gg = max(gg, s_high)
+                dd = min(dd, s_low)
+                pivot_end_idx = j
+                j += 1
+            else:
+                break
+
+        pivots.append(Pivot(
+            zg=zg,
+            zd=zd,
+            gg=gg,
+            dd=dd,
+            start_date=window[0].start_date,
+            end_date=strokes[pivot_end_idx].end_date,
+            start_index=i,
+            end_index=pivot_end_idx,
+            is_extending=(pivot_end_idx == len(strokes) - 1),
+        ))
+
+        # 下一轮从中枢结束后的下一笔开始
+        i = pivot_end_idx + 1
+
+    return pivots
+
+
+# ---------------------------------------------------------------------------
+# 线段中枢识别
 # ---------------------------------------------------------------------------
 
 def find_pivots(

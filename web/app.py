@@ -53,6 +53,7 @@ from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
 from web.components.progress_panel import render_progress  # noqa: E402
 from web.components.report_viewer import render_report  # noqa: E402
 from web.components.sidebar import render_sidebar  # noqa: E402
+from web.components.chanlun_chart import render_chanlun_tab  # noqa: E402
 from web.history import extract_signal, load_analysis  # noqa: E402
 from web.progress import ProgressTracker  # noqa: E402
 from web.runner import run_analysis_in_thread  # noqa: E402
@@ -206,7 +207,9 @@ with st.sidebar:
 
 # ── Main tabs ────────────────────────────────────────────────────────────────
 
-tab_analysis, tab_datasync = st.tabs(["📈 投研分析", "💾 数据同步"])
+tab_analysis, tab_chanlun, tab_datasync = st.tabs([
+    "📈 投研分析", "📊 缠论K线", "💾 数据同步",
+])
 
 
 # ── Tab 1: 投研分析 (original state machine) ───────────────────────────────
@@ -215,6 +218,7 @@ with tab_analysis:
     # Handle "Start Analysis" trigger
     start_req = st.session_state.pop("start_analysis", None)
     if start_req:
+        st.session_state.pop("report_overrides", None)  # clear stale overrides
         tracker = ProgressTracker(
             ticker=start_req["ticker"],
             trade_date=start_req["trade_date"],
@@ -230,6 +234,40 @@ with tab_analysis:
     tracker: ProgressTracker | None = st.session_state.get("tracker")
     viewing_history: str | None = st.session_state.get("viewing_history")
 
+    # ── Handle analyst rerun request ──────────────────────────────────────
+    pending_rerun: str | None = st.session_state.pop("pending_rerun", None)
+    if pending_rerun:
+        from web.components.analyst_rerunner import run_single_analyst, get_report_key, get_analyst_cn_name
+
+        # Determine ticker/trade_date from current context
+        rerun_ticker = ""
+        rerun_date = ""
+        if tracker and tracker.ticker:
+            rerun_ticker = tracker.ticker
+            rerun_date = tracker.trade_date
+        elif viewing_history:
+            rerun_ticker = Path(viewing_history).parent.parent.name
+            rerun_date = Path(viewing_history).stem.replace("full_states_log_", "")
+
+        if rerun_ticker and rerun_date:
+            cn_name = get_analyst_cn_name(pending_rerun)
+            with st.spinner(f"🔄 正在重新运行「{cn_name}」分析..."):
+                new_report = run_single_analyst(
+                    pending_rerun, rerun_ticker, rerun_date, _build_config()
+                )
+            if new_report:
+                report_key = get_report_key(pending_rerun)
+                st.session_state.setdefault("report_overrides", {})[report_key] = new_report
+                st.success(f"✅「{cn_name}」重新分析完成")
+            else:
+                st.warning(f"⚠️「{cn_name}」重新分析未产生有效报告")
+        else:
+            st.warning("无法确定分析上下文，请先完成一次完整分析")
+        # Don't rerun yet — let state machine continue to render
+
+    # Merge any overrides from re-runs
+    overrides = st.session_state.get("report_overrides", {})
+
     # State 1: Viewing a historical analysis
     if viewing_history:
         try:
@@ -237,7 +275,7 @@ with tab_analysis:
             signal = extract_signal(state)
             ticker = Path(viewing_history).parent.parent.name
             trade_date = Path(viewing_history).stem.replace("full_states_log_", "")
-            render_report(state, ticker, trade_date, signal)
+            render_report({**state, **overrides}, ticker, trade_date, signal)
         except Exception as exc:
             st.error(f"加载失败: {exc}")
 
@@ -250,7 +288,7 @@ with tab_analysis:
     # State 3: Analysis complete
     elif tracker and tracker.is_complete:
         render_report(
-            tracker.final_state,
+            {**tracker.final_state, **overrides},
             tracker.ticker,
             tracker.trade_date,
             tracker.signal,
@@ -264,7 +302,7 @@ with tab_analysis:
             with st.expander("📡 已完成的部分分析", expanded=True):
                 st.caption("_⚠️ 以下为出错前已完成的部分结果，可能不完整_")
                 render_report(
-                    tracker.partial_state,
+                    {**tracker.partial_state, **overrides},
                     tracker.ticker,
                     tracker.trade_date,
                     tracker.signal or "N/A",
@@ -323,6 +361,12 @@ with tab_analysis:
             """,
             unsafe_allow_html=True,
         )
+
+
+# ── Tab 2: 缠论K线图 ─────────────────────────────────────────────────────────
+
+with tab_chanlun:
+    render_chanlun_tab()
 
 
 # ── Helper functions (must be defined before use) ────────────────────────────

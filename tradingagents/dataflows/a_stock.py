@@ -538,8 +538,8 @@ _EASTMONEY_KLT = {
 }
 
 # Fallback order by level
-_KLINE_FALLBACK_MINUTE = ["eastmoney", "sina", "tencent", "tushare"]
-_KLINE_FALLBACK_DAILY = ["sina", "tencent", "tushare", "eastmoney"]
+_KLINE_FALLBACK_MINUTE = ["tickflow", "eastmoney", "sina", "tencent", "tushare"]
+_KLINE_FALLBACK_DAILY = ["tickflow", "sina", "tencent", "tushare", "eastmoney"]
 
 
 def _eastmoney_kline(code: str, level: str = "daily",
@@ -856,6 +856,77 @@ def _tushare_kline(code: str, level: str = "daily",
     return df
 
 
+def _tickflow_kline(code: str, level: str = "daily",
+                    start_date: str = None, datalen: int = 10000) -> pd.DataFrame:
+    """从 TickFlow 获取K线数据（1分~月线，需 API key）。
+
+    需要 SYSTEM_TICKFLOW_API_KEY 环境变量。如未设置则跳过。
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
+        Empty DataFrame if API key not configured or TickFlow not installed.
+    """
+    apikey = os.environ.get("SYSTEM_TICKFLOW_API_KEY", "")
+    if not apikey:
+        return pd.DataFrame()
+
+    try:
+        from tickflow import TickFlow
+    except ImportError:
+        logger.info("tickflow not installed, skipping TickFlow data source")
+        return pd.DataFrame()
+
+    # Convert 6-digit code to TickFlow symbol format
+    if code.startswith(("6", "9")):
+        symbol = f"{code}.SH"
+    elif code.startswith(("0", "3")):
+        symbol = f"{code}.SZ"
+    elif code.startswith(("8", "4")):
+        symbol = f"{code}.BJ"
+    else:
+        symbol = f"{code}.SZ"
+
+    # Map internal level to TickFlow period
+    _TF_PERIOD = {
+        "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+        "60min": "60m", "daily": "1d", "weekly": "1w", "monthly": "1M",
+    }
+    period = _TF_PERIOD.get(level, "1d")
+
+    try:
+        tf = TickFlow(api_key=apikey)
+        kwargs = dict(symbol=symbol, period=period, count=datalen,
+                      adjust="forward_additive", as_dataframe=True)
+        if start_date:
+            start_dt = pd.to_datetime(start_date)
+            kwargs["start_time"] = int(start_dt.timestamp() * 1000)
+        df = tf.klines.get(**kwargs)
+    except Exception as e:
+        logger.warning("TickFlow fetch failed for %s: %s", code, e)
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Convert DataFrame columns
+    rename_map = {
+        "trade_date": "Date",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
+    df = df.rename(columns=rename_map)
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    if start_date:
+        df = df[df["Date"] >= pd.to_datetime(start_date)]
+
+    return df
+
+
 def _ths_kline_5min(code: str, start_date: str = None,
                     datalen: int = 10000) -> pd.DataFrame:
     """从同花顺获取5分钟K线数据（用于聚合为更大级别K线）。
@@ -1158,6 +1229,7 @@ def _fetch_kline(code: str, level: str = "daily",
         "sina": _sina_kline,
         "tencent": _tencent_kline,
         "tushare": _tushare_kline,
+        "tickflow": _tickflow_kline,
     }
 
     errors: list[str] = []
@@ -2424,10 +2496,79 @@ def _get_financial_report_sina(
     return df.head(8)
 
 
+def _tushare_financial_report(
+    code: str, report_type: str, freq: str, curr_date: str = None,
+) -> pd.DataFrame:
+    """Fetch financial report via Tushare Pro API (primary source).
+
+    report_type: 'income' | 'balance' | 'cashflow'
+    Returns DataFrame or empty.
+    """
+    token = os.environ.get("SYSTEM_TUSHARE_TOKEN", "")
+    if not token:
+        return pd.DataFrame()
+
+    try:
+        import tushare as ts
+        ts.set_token(token)
+        pro = ts.pro_api()
+    except (ImportError, Exception) as e:
+        logger.warning("Tushare init failed: %s", e)
+        return pd.DataFrame()
+
+    # Convert 6-digit code to ts_code format
+    if code.startswith(("6", "9")):
+        ts_code = f"{code}.SH"
+    elif code.startswith("8") or code.startswith("4"):
+        ts_code = f"{code}.BJ"
+    else:
+        ts_code = f"{code}.SZ"
+
+    # Build kwargs
+    kwargs = {"ts_code": ts_code}
+    if curr_date:
+        try:
+            end_date_fmt = curr_date.replace("-", "")
+            kwargs["end_date"] = end_date_fmt
+        except Exception:
+            pass
+
+    try:
+        if report_type == "income":
+            df = pro.income(**kwargs)
+        elif report_type == "balance":
+            df = pro.balancesheet(**kwargs)
+        elif report_type == "cashflow":
+            df = pro.cashflow(**kwargs)
+        else:
+            return pd.DataFrame()
+    except Exception as e:
+        logger.warning("Tushare %s failed for %s: %s", report_type, code, e)
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Filter by freq: 'annual' means only keep rows where end_date ends with '1231'
+    if freq.lower() == "annual" and "end_date" in df.columns:
+        df = df[df["end_date"].astype(str).str.endswith("1231")]
+
+    # Filter by curr_date: only keep reports announced on or before curr_date
+    if curr_date and "ann_date" in df.columns:
+        try:
+            cutoff = curr_date.replace("-", "")
+            df = df[df["ann_date"].astype(str) <= cutoff]
+        except Exception:
+            pass
+
+    df = df.head(8)
+    return df
+
+
 def _eastmoney_financial_report(
     code: str, report_type: str, freq: str, curr_date: str = None,
 ) -> pd.DataFrame:
-    """Fetch financial report via 东财 datacenter (backup for Sina).
+    """Fetch financial report via 东财 datacenter (backup for Tushare/Sina).
 
     report_type: 'income' | 'balance' | 'cashflow'
     Returns DataFrame or empty.
@@ -2480,52 +2621,52 @@ def get_balance_sheet(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get balance sheet via Sina direct HTTP, with Eastmoney datacenter fallback."""
+    """Get balance sheet via Tushare Pro API, with Sina and Eastmoney fallback."""
     code = _normalize_ticker(ticker)
 
+    # Primary: Tushare Pro API
     try:
-        # Primary: Sina
-        df = _get_financial_report_sina(code, "资产负债表", freq, curr_date)
-
-        if df.empty:
-            # Fallback: 东财 datacenter
-            logger.info("Sina balance sheet empty for %s, trying Eastmoney", code)
-            df = _eastmoney_financial_report(code, "balance", freq, curr_date)
-            if not df.empty:
-                csv_string = df.to_csv(index=False)
-                header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
-                header += "# Data source: eastmoney datacenter (Sina unavailable)\n"
-                header += (
-                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                )
-                return header + csv_string
-            raise ValueError(f"No balance sheet data found for A-stock '{code}'")
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
+        df = _tushare_financial_report(code, "balance", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
+            header += "# Data source: Tushare Pro API\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
     except Exception as e:
-        # Last fallback: Eastmoney
-        try:
-            df = _eastmoney_financial_report(code, "balance", freq, curr_date)
-            if not df.empty:
-                csv_string = df.to_csv(index=False)
-                header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
-                header += "# Data source: eastmoney datacenter (Sina error fallback)\n"
-                header += (
-                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                )
-                return header + csv_string
-        except Exception:
-            pass
-        return f"Error retrieving balance sheet for {code}: {str(e)}"
+        logger.warning("Tushare balance sheet failed for %s: %s", code, e)
+
+    # Fallback 1: Sina direct HTTP
+    try:
+        df = _get_financial_report_sina(code, "资产负债表", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
+            header += "# Data source: sina direct HTTP\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
+    except Exception as e:
+        logger.warning("Sina balance sheet failed for %s: %s", code, e)
+
+    # Fallback 2: Eastmoney datacenter
+    try:
+        df = _eastmoney_financial_report(code, "balance", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
+            header += "# Data source: eastmoney datacenter\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
+    except Exception as e:
+        logger.warning("Eastmoney balance sheet failed for %s: %s", code, e)
+
+    return f"Error retrieving balance sheet for {code}: all sources failed"
 
 
 # ---- 5. get_cashflow ----
@@ -2536,52 +2677,52 @@ def get_cashflow(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get cash flow statement via Sina direct HTTP, with Eastmoney datacenter fallback."""
+    """Get cash flow statement via Tushare Pro API, with Sina and Eastmoney fallback."""
     code = _normalize_ticker(ticker)
 
+    # Primary: Tushare Pro API
     try:
-        # Primary: Sina
-        df = _get_financial_report_sina(code, "现金流量表", freq, curr_date)
-
-        if df.empty:
-            # Fallback: 东财 datacenter
-            logger.info("Sina cashflow empty for %s, trying Eastmoney", code)
-            df = _eastmoney_financial_report(code, "cashflow", freq, curr_date)
-            if not df.empty:
-                csv_string = df.to_csv(index=False)
-                header = f"# Cash Flow for {code} (A-stock, {freq})\n"
-                header += "# Data source: eastmoney datacenter (Sina unavailable)\n"
-                header += (
-                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                )
-                return header + csv_string
-            raise ValueError(f"No cash flow data found for A-stock '{code}'")
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Cash Flow for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
+        df = _tushare_financial_report(code, "cashflow", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Cash Flow for {code} (A-stock, {freq})\n"
+            header += "# Data source: Tushare Pro API\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
     except Exception as e:
-        # Last fallback: Eastmoney
-        try:
-            df = _eastmoney_financial_report(code, "cashflow", freq, curr_date)
-            if not df.empty:
-                csv_string = df.to_csv(index=False)
-                header = f"# Cash Flow for {code} (A-stock, {freq})\n"
-                header += "# Data source: eastmoney datacenter (Sina error fallback)\n"
-                header += (
-                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                )
-                return header + csv_string
-        except Exception:
-            pass
-        return f"Error retrieving cash flow for {code}: {str(e)}"
+        logger.warning("Tushare cashflow failed for %s: %s", code, e)
+
+    # Fallback 1: Sina direct HTTP
+    try:
+        df = _get_financial_report_sina(code, "现金流量表", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Cash Flow for {code} (A-stock, {freq})\n"
+            header += "# Data source: sina direct HTTP\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
+    except Exception as e:
+        logger.warning("Sina cashflow failed for %s: %s", code, e)
+
+    # Fallback 2: Eastmoney datacenter
+    try:
+        df = _eastmoney_financial_report(code, "cashflow", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Cash Flow for {code} (A-stock, {freq})\n"
+            header += "# Data source: eastmoney datacenter\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
+    except Exception as e:
+        logger.warning("Eastmoney cashflow failed for %s: %s", code, e)
+
+    return f"Error retrieving cash flow for {code}: all sources failed"
 
 
 # ---- 6. get_income_statement ----
@@ -2592,52 +2733,52 @@ def get_income_statement(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get income statement via Sina direct HTTP, with Eastmoney datacenter fallback."""
+    """Get income statement via Tushare Pro API, with Sina and Eastmoney fallback."""
     code = _normalize_ticker(ticker)
 
+    # Primary: Tushare Pro API
     try:
-        # Primary: Sina
-        df = _get_financial_report_sina(code, "利润表", freq, curr_date)
-
-        if df.empty:
-            # Fallback: 东财 datacenter
-            logger.info("Sina income empty for %s, trying Eastmoney", code)
-            df = _eastmoney_financial_report(code, "income", freq, curr_date)
-            if not df.empty:
-                csv_string = df.to_csv(index=False)
-                header = f"# Income Statement for {code} (A-stock, {freq})\n"
-                header += "# Data source: eastmoney datacenter (Sina unavailable)\n"
-                header += (
-                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                )
-                return header + csv_string
-            raise ValueError(f"No income statement data found for A-stock '{code}'")
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Income Statement for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
+        df = _tushare_financial_report(code, "income", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Income Statement for {code} (A-stock, {freq})\n"
+            header += "# Data source: Tushare Pro API\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
     except Exception as e:
-        # Last fallback: Eastmoney
-        try:
-            df = _eastmoney_financial_report(code, "income", freq, curr_date)
-            if not df.empty:
-                csv_string = df.to_csv(index=False)
-                header = f"# Income Statement for {code} (A-stock, {freq})\n"
-                header += "# Data source: eastmoney datacenter (Sina error fallback)\n"
-                header += (
-                    f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                )
-                return header + csv_string
-        except Exception:
-            pass
-        return f"Error retrieving income statement for {code}: {str(e)}"
+        logger.warning("Tushare income statement failed for %s: %s", code, e)
+
+    # Fallback 1: Sina direct HTTP
+    try:
+        df = _get_financial_report_sina(code, "利润表", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Income Statement for {code} (A-stock, {freq})\n"
+            header += "# Data source: sina direct HTTP\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
+    except Exception as e:
+        logger.warning("Sina income statement failed for %s: %s", code, e)
+
+    # Fallback 2: Eastmoney datacenter
+    try:
+        df = _eastmoney_financial_report(code, "income", freq, curr_date)
+        if not df.empty:
+            csv_string = df.to_csv(index=False)
+            header = f"# Income Statement for {code} (A-stock, {freq})\n"
+            header += "# Data source: eastmoney datacenter\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            return header + csv_string
+    except Exception as e:
+        logger.warning("Eastmoney income statement failed for %s: %s", code, e)
+
+    return f"Error retrieving income statement for {code}: all sources failed"
 
 
 # ---- 7. get_news ----

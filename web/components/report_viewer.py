@@ -25,13 +25,13 @@ def _signal_style(signal: str) -> tuple[str, str]:
 
 
 _ANALYST_SECTIONS = [
-    ("market_report", "📊 技术分析"),
-    ("sentiment_report", "💬 市场情绪"),
-    ("news_report", "📰 新闻舆情"),
-    ("fundamentals_report", "📋 基本面"),
-    ("policy_report", "🏛️ 政策分析"),
-    ("hot_money_report", "🔥 游资追踪"),
-    ("lockup_report", "🔒 解禁/减持"),
+    ("market_report", "📊 技术分析", "market"),
+    ("sentiment_report", "💬 市场情绪", "social"),
+    ("news_report", "📰 新闻舆情", "news"),
+    ("fundamentals_report", "📋 基本面", "fundamentals"),
+    ("policy_report", "🏛️ 政策分析", "policy"),
+    ("hot_money_report", "🔥 游资追踪", "hot_money"),
+    ("lockup_report", "🔒 解禁/减持", "lockup"),
 ]
 
 
@@ -100,7 +100,7 @@ def render_report(
 
     st.markdown("### 📊 分析师报告")
 
-    for key, title in _ANALYST_SECTIONS:
+    for key, title, analyst_type in _ANALYST_SECTIONS:
         content = final_state.get(key, "")
         if not content:
             continue
@@ -108,6 +108,12 @@ def render_report(
         stripped_content = _strip_think(str(content))
         has_repair_mark = "⚠️ **[质量门控:" in stripped_content
         badge = ' <span style="background:#7f1d1d;color:#fca5a5;font-size:0.7rem;padding:2px 6px;border-radius:4px;margin-left:0.3rem;">⚠️ 修复未通过</span>' if has_repair_mark else ""
+
+        # 重新分析按钮（不依赖 rerun — 自然触发 Streamlit 重跑）
+        rerun_key = f"rerun_btn_{analyst_type}"
+        if st.button("🔄 重新分析", key=rerun_key, help=f"重新运行「{title}」模块"):
+            st.session_state["pending_rerun"] = analyst_type
+
         with st.expander(f"{title}{badge}", expanded=False):
             st.markdown(stripped_content)
 

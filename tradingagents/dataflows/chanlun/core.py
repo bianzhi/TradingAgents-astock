@@ -191,93 +191,257 @@ def find_fractals(klines: list[ProcessedKLine]) -> list[Fractal]:
 
 
 # ---------------------------------------------------------------------------
-# 3. 笔划分
+# 3. 笔划分（严格参照 yifangmoyan 五步流程）
+#
+# 步骤：
+#   1. K线去包含（process_inclusion）
+#   2. 顶底分型识别 + ensure_alternating
+#   3. 初步顶底对匹配（match_fx_pairs）
+#   4. 分型失效检查（check_fx_invalidation）→ 重新配对
+#   5. 生成笔
 # ---------------------------------------------------------------------------
 
-def _filter_fractals(fractals: list[Fractal]) -> list[Fractal]:
-    """过滤分型：连续同类型只保留极值那个。
+# ═══════════════════════════════════════════════════════════════════════════
+# 步骤 2-helper: 强制顶底交替
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ensure_alternating(fxs: list[Fractal]) -> list[Fractal]:
+    """强制顶底交替 — 连续同类型只保留极值。
 
     规则：
-    1. 连续两个顶分型 → 保留高点更高的那个
-    2. 连续两个底分型 → 保留低点更低的那个
-    3. 顶底必须交替出现
+    - 连续顶分型 → 保留 high 更高的
+    - 连续底分型 → 保留 low 更低的
+    - 方向正确性（顶 > 底）由后续 match_fx_pairs 处理
     """
-    if not fractals:
+    if not fxs:
+        return []
+    out = [fxs[0]]
+    for f in fxs[1:]:
+        if f.type == out[-1].type:
+            # 同类型：保留极值
+            if (f.type == FractalType.TOP and f.value > out[-1].value) or \
+               (f.type == FractalType.BOTTOM and f.value < out[-1].value):
+                out[-1] = f
+        else:
+            out.append(f)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 步骤 3: 初步匹配顶底对
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _match_fx_pairs(fxs: list[Fractal]) -> list[tuple[int, int]]:
+    """在 fxs 序列上初步匹配顶底对。
+
+    要求：
+    - fxs 已通过 ensure_alternating 处理，理论上已交替
+    - 分型必须反向（Top→Bottom 或 Bottom→Top）
+    - 两个分型的 index 间隔 ≥ 3（中间至少 1 根独立K线）
+    - 方向正确：顶 > 底
+    - 同类型分型：保留更极端的（在 ensure_alternating 中已处理，
+      但匹配过程中仍可能有残留）
+
+    Returns:
+        list[tuple[int, int]] — 每对为 (start_idx_in_fxs, end_idx_in_fxs)
+    """
+    pairs: list[tuple[int, int]] = []
+    if len(fxs) < 2:
+        return pairs
+
+    curr_pos = 0
+    i = 1
+    while i < len(fxs):
+        curr = fxs[curr_pos]
+        nxt = fxs[i]
+
+        # 同类型：保留更极端的，继续前进
+        if nxt.type == curr.type:
+            should_replace = (curr.type == FractalType.TOP and nxt.value > curr.value) or \
+                             (curr.type == FractalType.BOTTOM and nxt.value < curr.value)
+            if should_replace:
+                curr_pos = i
+            i += 1
+            continue
+
+        # 间隔检查：分型 index 差 ≥ 3（中间至少 1 根独立K线）
+        if abs(nxt.index - curr.index) < 3:
+            i += 1
+            continue
+
+        # 方向检查：顶 > 底
+        direction_ok = (curr.type == FractalType.TOP and nxt.value < curr.value) or \
+                       (curr.type == FractalType.BOTTOM and nxt.value > curr.value)
+        if direction_ok:
+            pairs.append((curr_pos, i))
+            curr_pos = i  # 匹配成功，终点作为下一笔起点
+
+        i += 1
+
+    return pairs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 步骤 4: 分型失效检查
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _check_fx_invalidation(
+    fxs: list[Fractal],
+    pairs: list[tuple[int, int]],
+    bars: list[ProcessedKLine],
+) -> list[tuple[int, int]]:
+    """检查分型是否失效，失效则整对删除。
+
+    核心规则（缠论第62、77课）：
+    - 检查范围：从 start_fx.index+1 到 end_fx.index-1（即下一个反向分型 k1 前）
+    - 一旦反向分型 k1 出现，前分型锁定不可逆
+    - 顶分型：该区间内有更高的 high → 失效
+    - 底分型：该区间内有更低的 low → 失效
+    - 整对失效：start 和 end 分型都移除
+    """
+    if not pairs:
         return []
 
-    filtered: list[Fractal] = [fractals[0]]
+    invalid_indices: set[int] = set()
 
-    for f in fractals[1:]:
-        last = filtered[-1]
+    for pair in pairs:
+        si, ei = pair
+        start_fx = fxs[si]
+        end_fx = fxs[ei]
 
-        if f.type == last.type:
-            # 同类型，保留极值
-            if f.type == FractalType.TOP:
-                if f.value > last.value:
-                    filtered[-1] = f
-            else:  # BOTTOM
-                if f.value < last.value:
-                    filtered[-1] = f
+        # 检查起始位置：分型 index 的下一根 bar
+        check_start = start_fx.index + 1
+        # 检查终止位置：反向分型 index-1（即其 k1 前一位置）
+        check_end = end_fx.index - 1
+
+        if check_start > check_end:
+            continue
+
+        invalid = False
+        if start_fx.type == FractalType.TOP:
+            # 顶分型：区间内有更高点 → 失效
+            for j in range(check_start, check_end + 1):
+                if j < len(bars) and bars[j].high > start_fx.value:
+                    invalid = True
+                    break
         else:
-            # 不同类型，加入
-            # 但需检查：如果前一个顶比后一个底还低，或前一个底比后一个顶还高，
-            # 则不符合笔的定义，需调整
-            filtered.append(f)
+            # 底分型：区间内有更低点 → 失效
+            for j in range(check_start, check_end + 1):
+                if j < len(bars) and bars[j].low < start_fx.value:
+                    invalid = True
+                    break
 
-    # 二次调整：确保顶底的值满足"顶高于底"
-    # 如果出现 顶的值 <= 后续底的值，或 底的值 >= 后续顶的值，删除较弱的那一个
-    changed = True
-    while changed:
-        changed = False
-        i = 0
-        while i < len(filtered) - 1:
-            curr = filtered[i]
-            nxt = filtered[i + 1]
+        if invalid:
+            invalid_indices.add(si)
+            invalid_indices.add(ei)
 
-            # 顶后跟底，顶值应 > 底值
-            if curr.type == FractalType.TOP and nxt.type == FractalType.BOTTOM:
-                if curr.value <= nxt.value:
-                    # 删除较弱的那个
-                    if i > 0:
-                        filtered.pop(i)
-                    else:
-                        filtered.pop(i + 1)
-                    changed = True
-                    continue
+    # 保留有效分型，重新配对
+    valid_indices = [i for i in range(len(fxs)) if i not in invalid_indices]
+    return _match_fx_pairs_from_indices(fxs, valid_indices)
 
-            # 底后跟顶，底值应 < 顶值
-            elif curr.type == FractalType.BOTTOM and nxt.type == FractalType.TOP:
-                if curr.value >= nxt.value:
-                    if i > 0:
-                        filtered.pop(i)
-                    else:
-                        filtered.pop(i + 1)
-                    changed = True
-                    continue
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 步骤 4-helper: 用指定索引子集重新配对
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _match_fx_pairs_from_indices(
+    fxs: list[Fractal],
+    indices: list[int],
+) -> list[tuple[int, int]]:
+    """用指定的分型子集重新配对。
+
+    与 _match_fx_pairs 不同的是，子集中可能出现连续同类型分型
+    （失效删除可能暴露出被交替过滤掉的分型），此时需要回溯修改
+    已确认 pair 的端点（替换为更极端的）。
+    """
+    pairs: list[tuple[int, int]] = []
+    if len(indices) < 2:
+        return pairs
+
+    curr_idx = 0  # 在 indices 中的位置
+    i = 1
+    while i < len(indices):
+        curr = fxs[indices[curr_idx]]
+        nxt = fxs[indices[i]]
+
+        # 同类型：保留更极端的，如已配对则回溯修改
+        if nxt.type == curr.type:
+            should_replace = (curr.type == FractalType.TOP and nxt.value > curr.value) or \
+                             (curr.type == FractalType.BOTTOM and nxt.value < curr.value)
+            if should_replace:
+                # 回溯：如果已配对且终点就是 curr，更新终点
+                if pairs and pairs[-1][1] == indices[curr_idx]:
+                    pairs[-1] = (pairs[-1][0], indices[i])
+                curr_idx = i
             i += 1
+            continue
 
-    return filtered
+        # 间隔检查
+        if abs(nxt.index - curr.index) < 3:
+            i += 1
+            continue
 
+        # 方向检查
+        direction_ok = (curr.type == FractalType.TOP and nxt.value < curr.value) or \
+                       (curr.type == FractalType.BOTTOM and nxt.value > curr.value)
+        if direction_ok:
+            pairs.append((indices[curr_idx], indices[i]))
+            curr_idx = i
+
+        i += 1
+
+    return pairs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 步骤 5: 生成笔
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _create_strokes(
+    fxs: list[Fractal],
+    pairs: list[tuple[int, int]],
+) -> list[Stroke]:
+    """将顶底对转为笔。"""
+    strokes: list[Stroke] = []
+    for si, ei in pairs:
+        start_fx = fxs[si]
+        end_fx = fxs[ei]
+
+        direction = Direction.DOWN if start_fx.type == FractalType.TOP else Direction.UP
+        strokes.append(Stroke(
+            direction=direction,
+            start_index=start_fx.index,
+            end_index=end_fx.index,
+            start_date=start_fx.date,
+            end_date=end_fx.date,
+            start_value=start_fx.value,
+            end_value=end_fx.value,
+        ))
+    return strokes
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 入口函数
+# ═══════════════════════════════════════════════════════════════════════════
 
 def identify_strokes(
     klines: list[ProcessedKLine],
     fractals: list[Fractal] | None = None,
 ) -> list[Stroke]:
-    """划分笔（第65课）。
+    """划分笔 — 严格五步流程。
 
-    规则：
-    1. 顶底必须交替
-    2. 一笔 = 一个顶分型到一个底分型（或反之）
-    3. 顶底之间至少有1根独立K线（处理后K线）
-       即从顶分型到相邻底分型之间，在处理后K线中至少间隔1根。
+    1. （klines 已通过 process_inclusion 去包含）
+    2. 分型识别 + ensure_alternating
+    3. 初步匹配顶底对
+    4. 分型失效检查 → 重新配对
+    5. 生成笔
 
     Args:
-        klines: 处理后K线序列
+        klines: 处理后K线序列（已去包含）
         fractals: 可选，预计算的分型列表。若为None则自动计算。
 
     Returns:
-        笔序列。
+        笔序列（严格交替）。
     """
     if fractals is None:
         fractals = find_fractals(klines)
@@ -285,48 +449,18 @@ def identify_strokes(
     if len(fractals) < 2:
         return []
 
-    # 过滤分型
-    filtered = _filter_fractals(fractals)
-
-    if len(filtered) < 2:
+    # 步骤2b: 强制交替
+    fxs = ensure_alternating(fractals)
+    if len(fxs) < 2:
         return []
 
-    # 检查顶底之间是否有足够间隔（至少1根独立K线）
-    # 此处"独立K线"指顶底分型中间的K线索引差 > 0
-    # 分型的index是处理后K线序列的位置
-    strokes: list[Stroke] = []
+    # 步骤3: 初步匹配
+    pairs = _match_fx_pairs(fxs)
+    if not pairs:
+        return []
 
-    for i in range(len(filtered) - 1):
-        f1 = filtered[i]
-        f2 = filtered[i + 1]
+    # 步骤4: 失效检查 + 重新配对
+    valid_pairs = _check_fx_invalidation(fxs, pairs, klines)
 
-        # 顶底交替性检查
-        if f1.type == f2.type:
-            continue
-
-        # 独立K线检查：两个分型之间至少间隔1根处理后K线
-        # 分型index之差 >= 2 意味着中间至少有1根K线（分型中间的那根）
-        # 但严格来说，分型本身由3根K线构成，两个相邻分型如果共享K线，
-        # 则中间没有独立K线。index差>=3才保证至少1根独立K线。
-        # 第65课：顶底分型之间至少有1根独立K线不可共用
-        if abs(f2.index - f1.index) < 3:
-            # 特殊情况：如果两个分型之间连1根独立K线都没有，
-            # 需要取强弱判断保留哪个
-            continue
-
-        if f1.type == FractalType.TOP:
-            direction = Direction.DOWN
-        else:
-            direction = Direction.UP
-
-        strokes.append(Stroke(
-            direction=direction,
-            start_index=f1.index,
-            end_index=f2.index,
-            start_date=f1.date,
-            end_date=f2.date,
-            start_value=f1.value,
-            end_value=f2.value,
-        ))
-
-    return strokes
+    # 步骤5: 生成笔
+    return _create_strokes(fxs, valid_pairs)

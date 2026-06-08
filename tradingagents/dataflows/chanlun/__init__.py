@@ -13,7 +13,7 @@ from .types import (
 )
 from .core import process_inclusion, find_fractals, identify_strokes
 from .segment import identify_segments
-from .pivot import find_pivots, classify_trends
+from .pivot import find_stroke_pivots, find_pivots, classify_trends
 from .divergence import detect_divergence
 from .buy_sell_points import find_buy_sell_points
 
@@ -52,8 +52,8 @@ def analyze(
     # 4. 线段划分
     segments = identify_segments(strokes)
 
-    # 5. 中枢识别
-    pivots = find_pivots(segments)
+    # 5. 笔中枢识别（直接基于笔，而非线段）
+    pivots = find_stroke_pivots(strokes)
 
     # 6. 走势类型
     trends = classify_trends(segments, pivots)
